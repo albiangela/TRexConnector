@@ -1,0 +1,14 @@
+# BAMBI detection framework — provides the georeferencing / projection pipeline
+# (label_to_world_coordinates, DEM mesh handling, camera model).
+bambi_detection @ git+https://github.com/bambi-eco/bambi_detection.git
+
+# ALFS rendering/geo library that bambi_detection builds on (alfspy.*).
+alfspy @ git+https://github.com/bambi-eco/alfs_py.git
+
+# Direct runtime dependencies of the connector script. Versions mirror
+# bambi_detection's requirements to stay compatible with alfspy.
+numpy~=1.23.1
+opencv-python>=4.7.0.72
+trimesh==3.21.7
+pyrr==0.10.3
+pygltflib==1.15.2
