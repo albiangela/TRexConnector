@@ -408,6 +408,25 @@ def main(argv=None) -> None:
     with open(args.dem_json, "r", encoding="utf-8") as f:
         dem_meta = json.load(f)
     offsets = tuple(float(v) for v in dem_meta["origin"])
+    # Detect geographic (degree) origin and convert to UTM — same fix as in run_export_geotiffs.
+    # Without this, a geographic JSON gives z_off=-103.61 (DEM min) instead of -98.46 (origin
+    # altitude), causing a ~5 m z-plane difference vs the GeoTIFF export and lateral box drift.
+    x_off, y_off, z_off = offsets
+    if abs(x_off) <= 180 and abs(y_off) <= 90:
+        try:
+            from pyproj import Transformer
+            wgs84 = dem_meta.get("origin_wgs84", {})
+            lat = float(wgs84.get("latitude", y_off))
+            lon = float(wgs84.get("longitude", x_off))
+            z_off = float(wgs84.get("altitude", z_off))
+            crs_str = str(dem_meta.get("crs", "EPSG:32633"))
+            epsg_num = int(crs_str.split(":")[-1]) if "EPSG:" in crs_str else 32633
+            _t = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg_num}", always_xy=True)
+            x_off, y_off = _t.transform(lon, lat)
+            offsets = (x_off, y_off, z_off)
+            print(f"   Geographic origin auto-converted to UTM: ({x_off:.2f}, {y_off:.2f})")
+        except Exception as _e:
+            print(f"   Warning: origin conversion failed ({_e}). Coordinates may be wrong.")
     print(f"   DEM CRS {dem_meta.get('crs')}, origin offset {offsets}")
 
     with open(args.poses, "r", encoding="utf-8") as f:
