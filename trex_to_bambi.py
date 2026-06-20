@@ -165,15 +165,18 @@ def write_detections_txt(detections: List[Detection], out_path: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Step 2: pixel-space (distorted) MOT tracks
+# Step 2: pixel-space MOT tracks (distorted or undistorted)
 # --------------------------------------------------------------------------- #
-def write_pixel_tracks_csv(detections: List[Detection], out_path: str) -> None:
+def write_pixel_tracks_csv(detections: List[Detection], out_path: str,
+                           undistorter: Optional["Undistorter"] = None) -> None:
     """
-    Write the *distorted, non-geo-referenced* tracks in raw video-pixel space.
+    Write pixel-space, non-geo-referenced tracks in MOT format.
 
-    This is the 2D analogue of the geo-referenced ``tracks.csv``: same MOT-style
-    layout, but the bounding box is the raw (distorted) pixel box straight from
-    the npz tracklets, with no undistortion or world projection applied.
+    When ``undistorter`` is None the raw (distorted) video-pixel coordinates
+    from the npz tracklets are written directly.  When an ``Undistorter`` is
+    supplied the four bounding-box corners are mapped through the same
+    undistortion pipeline used by the BAMBI frame extractor, producing
+    coordinates in the undistorted square-frame pixel space.
 
     Columns: frame(8d), track_id, x1, y1, x2, y2, confidence, class_id, flag
     (flag is always 0 = real detection, matching tracks.csv).
@@ -181,9 +184,21 @@ def write_pixel_tracks_csv(detections: List[Detection], out_path: str) -> None:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         for d in detections:
+            if undistorter is not None:
+                corners = np.array(
+                    [[d.x1, d.y1], [d.x2, d.y1], [d.x2, d.y2], [d.x1, d.y2]],
+                    dtype=np.float32,
+                )
+                und = undistorter.points(corners)
+                x1 = float(und[:, 0].min())
+                y1 = float(und[:, 1].min())
+                x2 = float(und[:, 0].max())
+                y2 = float(und[:, 1].max())
+            else:
+                x1, y1, x2, y2 = d.x1, d.y1, d.x2, d.y2
             f.write(
-                f"{d.frame:08d},{d.track_id},{d.x1:.6f},{d.y1:.6f},"
-                f"{d.x2:.6f},{d.y2:.6f},{d.confidence:.6f},{d.class_id},0\n"
+                f"{d.frame:08d},{d.track_id},{x1:.6f},{y1:.6f},"
+                f"{x2:.6f},{y2:.6f},{d.confidence:.6f},{d.class_id},0\n"
             )
     print(f"Wrote {len(detections)} pixel-space track rows -> {out_path}")
 
@@ -391,6 +406,7 @@ def main(argv=None) -> None:
 
     det_path = _default(args.out_dir, "detections_w", "detections.txt")
     pixel_tracks_path = _default(args.out_dir, "tracks_pixel_w", "tracks_pixel.csv")
+    pixel_tracks_und_path = _default(args.out_dir, "tracks_pixel_w", "tracks_pixel_undistorted.csv")
     georef_path = _default(args.out_dir, "georeferenced_w", "georeferenced.txt")
     tracks_path = _default(args.out_dir, "tracks_w", "tracks.csv")
 
@@ -456,6 +472,8 @@ def main(argv=None) -> None:
                              "or ensure the npz files contain 'video_size'.")
         undistorter = Undistorter(args.calib, raw_size)
         print(f"   Undistorting {raw_size} -> {undistorter.new_size} using {os.path.basename(args.calib)}")
+        write_pixel_tracks_csv(detections, pixel_tracks_und_path, undistorter)
+        print(f"   -> undistorted pixel tracks: {pixel_tracks_und_path}")
 
     if args.input_resolution is not None:
         input_resolution = Resolution(args.input_resolution[0], args.input_resolution[1])
