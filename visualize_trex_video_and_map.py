@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
+import json
 import numpy as np
 
 try:
@@ -73,6 +74,69 @@ try:
     _HAS_MAP_DEPS = True
 except Exception:  # pragma: no cover - map background is optional
     _HAS_MAP_DEPS = False
+
+
+# ============================================================
+# UNDISTORTION (raw video pixels -> undistorted frame pixels)
+# ============================================================
+
+class Undistorter:
+    """
+    Mirrors the BAMBI CalibratedVideoFrameAccessor undistortion so that
+    raw-video pixel coordinates can be mapped into the undistorted frame
+    space used by the exported frames / poses.
+
+    Pass an instance to undistort_frame_dets() after loading pixel tracks.
+    """
+
+    def __init__(self, calib_path: str, raw_size: Tuple[int, int],
+                 alpha: float = 0.5, center_principal_point: bool = True,
+                 force_same_fov: bool = True):
+        with open(calib_path, "r", encoding="utf-8") as f:
+            calib = json.load(f)
+        mtx_raw = calib.get("mtx") or calib.get("camera_matrix")
+        dist_raw = calib.get("dist") or calib.get("dist_coefs")
+        if mtx_raw is None or dist_raw is None:
+            raise KeyError(
+                f"Calibration file must contain 'mtx'+'dist' or "
+                f"'camera_matrix'+'dist_coefs' keys: {calib_path}"
+            )
+        self.mtx = np.asarray(mtx_raw, dtype=float)
+        self.dist = np.asarray(dist_raw, dtype=float)
+
+        w, h = raw_size
+        wh = min(w, h)
+        self.new_size = (wh, wh)
+        ncm, _ = cv2.getOptimalNewCameraMatrix(
+            self.mtx, self.dist, (w, h), alpha, self.new_size,
+            centerPrincipalPoint=center_principal_point,
+        )
+        if force_same_fov:
+            fxy = max(ncm[0, 0], ncm[1, 1])
+            ncm[0, 0] = ncm[1, 1] = fxy
+        self.new_camera_matrix = ncm
+        self.raw_size = raw_size
+
+    def points(self, pts_xy: np.ndarray) -> np.ndarray:
+        pts = np.asarray(pts_xy, dtype=np.float32).reshape(-1, 1, 2)
+        out = cv2.undistortPoints(pts, self.mtx, self.dist, P=self.new_camera_matrix)
+        return out.reshape(-1, 2)
+
+
+def undistort_frame_dets(frame_dets: Dict[int, List[dict]], undistorter: Undistorter) -> None:
+    """Undistort all pixel-space bounding boxes and key-points in-place."""
+    for dets in frame_dets.values():
+        for det in dets:
+            corners = np.array([[det["x1"], det["y1"]], [det["x2"], det["y2"]]], dtype=np.float32)
+            und = undistorter.points(corners)
+            det["x1"], det["y1"] = float(und[0, 0]), float(und[0, 1])
+            det["x2"], det["y2"] = float(und[1, 0]), float(und[1, 1])
+            det["cx"] = (det["x1"] + det["x2"]) / 2.0
+            det["cy"] = (det["y1"] + det["y2"]) / 2.0
+            if det.get("keypoints"):
+                kp = np.array(det["keypoints"], dtype=np.float32)
+                und_kp = undistorter.points(kp)
+                det["keypoints"] = list(zip(und_kp[:, 0].tolist(), und_kp[:, 1].tolist()))
 
 
 # ============================================================
@@ -322,7 +386,8 @@ class MapTileProvider:
 # ============================================================
 
 def load_trex_tracklets(tracking_dir: str, video_stem: str,
-                        video_w: int, video_h: int) -> Tuple[Dict[int, List[dict]], int]:
+                        video_w: int, video_h: int,
+                        ) -> Tuple[Dict[int, List[dict]], int, Optional[Tuple[int, int]]]:
     """
     Loads all ``<video_stem>_id<N>.npz`` TRex tracklets.
 
@@ -330,8 +395,8 @@ def load_trex_tracklets(tracking_dir: str, video_stem: str,
     key-points (``poseX0..8`` / ``poseY0..8``). Invalid key-points are encoded
     by TRex as ``inf`` or ``0`` and are filtered out.
 
-    :return: (frame_dets, n_tracks) where ``frame_dets`` maps a frame index to a
-             list of detection dicts (tid, x1, y1, x2, y2, cx, cy, conf, keypoints).
+    :return: (frame_dets, n_tracks, raw_video_size) where ``raw_video_size`` is
+             the raw video dimensions read from the npz (or None if not stored).
     """
     files = sorted(glob(os.path.join(tracking_dir, f"{video_stem}_id*.npz")))
     if not files:
@@ -339,9 +404,13 @@ def load_trex_tracklets(tracking_dir: str, video_stem: str,
             f"No TRex tracklets matching '{video_stem}_id*.npz' in {tracking_dir}")
 
     frame_dets: Dict[int, List[dict]] = defaultdict(list)
+    raw_video_size: Optional[Tuple[int, int]] = None
 
     for fp in files:
         d = np.load(fp, allow_pickle=True)
+        if raw_video_size is None and "video_size" in d:
+            vs = d["video_size"]
+            raw_video_size = (int(vs[0]), int(vs[1]))
         tid = int(d["id"][0])
 
         frames = d["frame"]
@@ -373,7 +442,7 @@ def load_trex_tracklets(tracking_dir: str, video_stem: str,
                 "keypoints": list(zip(vx.tolist(), vy.tolist())),
             })
 
-    return frame_dets, len(files)
+    return frame_dets, len(files), raw_video_size
 
 
 def load_pixel_tracks(csv_path: str) -> Tuple[Dict[int, List[dict]], int]:
@@ -664,6 +733,14 @@ def parse_args():
                    help="Optional subset of track ids to display.")
     p.add_argument("--max-frames", type=int, default=None, help="Stop after N frames (debugging).")
     p.add_argument("--map-cache", default=None, help="Directory to cache downloaded map tiles.")
+    p.add_argument("--calib", default=None,
+                   help="Camera calibration JSON (mtx/dist). When provided, pixel-space bounding "
+                        "boxes are undistorted before drawing. Use this when --video is made from "
+                        "the QGIS-exported undistorted frames rather than the original raw video.")
+    p.add_argument("--raw-size", type=int, nargs=2, metavar=("W", "H"), default=None,
+                   help="Raw video dimensions in pixels (e.g. 5120 2700). Required with --calib "
+                        "when using --pixel-tracks-csv; inferred from the NPZ files when using "
+                        "--tracking-dir.")
     return p.parse_args()
 
 
@@ -688,13 +765,29 @@ def main():
     print(f"Video      : {video_path}  ({video_w}x{video_h} @ {src_fps:.1f} fps)")
 
     # --- Load tracking data (TRex tracklets or pixel-space MOT CSV) ---
+    npz_raw_size: Optional[Tuple[int, int]] = None
     if args.pixel_tracks_csv:
         frame_dets, n_tracks = load_pixel_tracks(args.pixel_tracks_csv)
         print(f"MOT pixel  : {n_tracks} tracks, detections on {len(frame_dets)} frames "
               f"({os.path.basename(args.pixel_tracks_csv)})")
     else:
-        frame_dets, n_tracks = load_trex_tracklets(args.tracking_dir, video_stem, video_w, video_h)
+        frame_dets, n_tracks, npz_raw_size = load_trex_tracklets(
+            args.tracking_dir, video_stem, video_w, video_h)
         print(f"TRex       : {n_tracks} tracklets, detections on {len(frame_dets)} frames")
+
+    # --- Undistort pixel coordinates when --video is the exported undistorted frames ---
+    if args.calib:
+        raw_size = tuple(args.raw_size) if args.raw_size else npz_raw_size
+        if raw_size is None:
+            raise ValueError(
+                "--calib requires --raw-size when using --pixel-tracks-csv "
+                "(the raw video dimensions, e.g. --raw-size 5120 2700)."
+            )
+        undistorter = Undistorter(args.calib, raw_size)
+        print(f"Undistort  : {raw_size[0]}x{raw_size[1]} -> "
+              f"{undistorter.new_size[0]}x{undistorter.new_size[1]} "
+              f"using {os.path.basename(args.calib)}")
+        undistort_frame_dets(frame_dets, undistorter)
 
     frame_geo, extent = load_geo_tracks(args.tracks_csv)
     if extent is None:
