@@ -7,16 +7,22 @@ tracklets on the original video and, side by side, plots the geo-referenced
 ``tracks.csv`` that ``trex_to_bambi.py`` produces, so a TRex run can be checked
 visually end to end.
 
-Left panel : the original video with per-track bounding boxes (derived from the
-             TRex pose key-points) and ID labels drawn in pixel space.
+Left panel : the original video with per-track bounding boxes and ID labels
+             drawn in pixel space. The boxes come either from the TRex pose
+             key-points (``--tracking-dir``) or from a pixel-space MOT CSV
+             (``--pixel-tracks-csv``); exactly one of the two is used.
 Right panel: a 2D map of the geo-referenced tracks (projected coordinates from
              ``tracks.csv``) with per-track boxes, trajectory trails and an
-             optional satellite background.
+             optional satellite background. When a poses JSON (``--poses``) and
+             its DEM metadata (``--dem-json``) are supplied, the drone's own
+             position and flight trail are drawn on the map too.
 
 The TRex tracking output is one ``*_id<N>.npz`` file per track. Each file holds,
 per video frame, the centroid, the 9 pose key-points (``poseX0..8`` /
-``poseY0..8``) and the detection confidence/class. The geo-referenced tracks
-share the same frame indices and track ids, so the two panels stay in sync.
+``poseY0..8``) and the detection confidence/class. Alternatively, the pixel-space
+MOT CSV (``tracks_pixel.csv`` from ``trex_to_bambi.py``) carries the raw
+(distorted) bounding boxes directly, without key-points. Either way the frame
+indices and track ids match the geo-referenced tracks, so the panels stay in sync.
 
 Output is encoded with BAMBI's ``PipeFFMPEGWriter`` (libx264) when available,
 falling back to ``cv2.VideoWriter`` (mp4v) otherwise — so the only hard runtime
@@ -28,6 +34,24 @@ Example:
         --tracking-dir /path/to/tracking \
         --tracks-csv   /path/to/output/tracks_w/tracks.csv \
         --epsg 32643
+
+    # or drive the video panel from a pixel-space MOT CSV instead:
+    python visualize_trex_video_and_map.py \
+        --video            /path/to/20240307_063012765_DJI_0463.MP4 \
+        --pixel-tracks-csv /path/to/output/tracks_pixel_w/tracks_pixel.csv \
+        --tracks-csv       /path/to/output/tracks_w/tracks.csv \
+        --epsg 32643
+
+    or
+
+      python visualize_trex_video_and_map.py
+      --video            "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/qgis5/poses_w.mp4"
+      --pixel-tracks-csv "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/trex13/tracks_pixel_w/tracks_pixel.csv"
+      --tracks-csv       "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/trex13/tracks_w/tracks.csv"
+      --poses            "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/qgis5/poses_w.json"
+      --dem-json         "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/qgis5/flat_surface_dem.json"
+      --output           "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/qgis5/poses_w_vis.mp4"
+      --epsg 32643
 """
 
 import argparse
@@ -35,7 +59,6 @@ import colorsys
 import hashlib
 import math
 import os
-import sys
 from collections import defaultdict
 from glob import glob
 from pathlib import Path
@@ -56,30 +79,13 @@ except Exception:  # pragma: no cover - map background is optional
 # 0. OPTIONAL BAMBI VIDEO WRITER
 # ============================================================
 
-def _ensure_bambi_importable(bambi_path: Optional[str] = None) -> None:
-    """
-    Make ``bambi_detection`` importable (only needed for the high-quality FFMPEG
-    writer). Mirrors the resolution logic in ``trex_to_bambi.py``: honour an
-    explicit path, then the ``BAMBI_DETECTION_PATH`` environment variable.
-    """
-    candidate = bambi_path or os.environ.get("BAMBI_DETECTION_PATH")
-    if candidate and os.path.isdir(candidate):
-        for extra in (candidate, os.path.join(candidate, "src")):
-            if os.path.isdir(extra) and extra not in sys.path:
-                sys.path.insert(0, extra)
-
-
-def make_ffmpeg_writer(bambi_path: Optional[str] = None):
+def make_ffmpeg_writer():
     """
     Return a BAMBI ``PipeFFMPEGWriter`` instance, or ``None`` if it (or ffmpeg)
     is unavailable. Constructing the writer probes ``ffmpeg -version``.
     """
-    _ensure_bambi_importable(bambi_path)
     try:
-        try:  # installed package
-            from bambi.video.video_writer import PipeFFMPEGWriter
-        except ImportError:  # repo checkout (src/ layout)
-            from src.bambi.video.video_writer import PipeFFMPEGWriter
+        from bambi.video.video_writer import PipeFFMPEGWriter
         return PipeFFMPEGWriter(silent=True)
     except Exception as e:
         print(f"FFMPEG writer unavailable ({e}); using cv2.VideoWriter fallback.")
@@ -370,6 +376,47 @@ def load_trex_tracklets(tracking_dir: str, video_stem: str,
     return frame_dets, len(files)
 
 
+def load_pixel_tracks(csv_path: str) -> Tuple[Dict[int, List[dict]], int]:
+    """
+    Loads pixel-space (distorted) tracks from a MOT-style CSV, as written by
+    ``trex_to_bambi.py`` (``tracks_pixel.csv``).
+
+    Columns: frame, track_id, x1, y1, x2, y2, confidence, class_id, flag
+    (raw video-pixel coordinates; no pose key-points).
+
+    :return: (frame_dets, n_tracks) in the same shape as
+             :func:`load_trex_tracklets`, with an empty ``keypoints`` list.
+    """
+    frame_dets: Dict[int, List[dict]] = defaultdict(list)
+    tids: set = set()
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) < 6:
+                continue
+
+            frame = int(float(parts[0]))
+            tid = int(float(parts[1]))
+            x1, y1 = float(parts[2]), float(parts[3])
+            x2, y2 = float(parts[4]), float(parts[5])
+            conf = float(parts[6]) if len(parts) > 6 else 1.0
+            tids.add(tid)
+
+            frame_dets[frame].append({
+                "tid": tid,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "cx": (x1 + x2) / 2.0, "cy": (y1 + y2) / 2.0,
+                "conf": conf,
+                "keypoints": [],
+            })
+
+    return frame_dets, len(tids)
+
+
 def load_geo_tracks(csv_path: str) -> Tuple[Dict[int, List[dict]], Optional[Tuple[float, float, float, float]]]:
     """
     Loads the geo-referenced tracks from ``tracks.csv``.
@@ -415,6 +462,79 @@ def load_geo_tracks(csv_path: str) -> Tuple[Dict[int, List[dict]], Optional[Tupl
     if min_x == float("inf"):
         return frame_geo, None
     return frame_geo, (min_x, max_x, min_y, max_y)
+
+
+def load_dem_offsets(dem_json_path: str) -> Tuple[float, float, float]:
+    """
+    Read the DEM metadata JSON and return the ``(x_off, y_off, z_off)`` origin
+    offset in the projected CRS, mirroring the logic in ``trex_to_bambi.py``.
+
+    A geographic (degree) origin is auto-converted to UTM so it matches the
+    coordinates in ``tracks.csv``.
+    """
+    import json
+
+    with open(dem_json_path, "r", encoding="utf-8") as f:
+        dem_meta = json.load(f)
+    x_off, y_off, z_off = (float(v) for v in dem_meta["origin"])
+
+    # Geographic origin (degrees) -> UTM, same fix as trex_to_bambi.py.
+    if abs(x_off) <= 180 and abs(y_off) <= 90:
+        try:
+            from pyproj import Transformer
+            wgs84 = dem_meta.get("origin_wgs84", {})
+            lat = float(wgs84.get("latitude", y_off))
+            lon = float(wgs84.get("longitude", x_off))
+            z_off = float(wgs84.get("altitude", z_off))
+            crs_str = str(dem_meta.get("crs", "EPSG:32633"))
+            epsg_num = int(crs_str.split(":")[-1]) if "EPSG:" in crs_str else 32633
+            t = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg_num}", always_xy=True)
+            x_off, y_off = t.transform(lon, lat)
+            print(f"   DEM geographic origin auto-converted to UTM: ({x_off:.2f}, {y_off:.2f})")
+        except Exception as e:
+            print(f"   Warning: DEM origin conversion failed ({e}). Drone positions may be wrong.")
+    return x_off, y_off, z_off
+
+
+def load_drone_positions(poses_path: str, dem_json_path: str
+                         ) -> Tuple[Dict[int, Tuple[float, float]], Optional[Tuple[float, float, float, float]]]:
+    """
+    Load per-frame drone positions from a poses JSON.
+
+    The poses ``location`` is in mesh-local coordinates (the same space
+    ``trex_to_bambi.py`` projects in); adding the DEM origin offset places it in
+    the projected CRS of ``tracks.csv``. The poses image index is the frame
+    index, matching the geo-referenced tracks.
+
+    :return: (frame_drone, extent) where ``frame_drone`` maps a frame index to a
+             ``(x, y)`` position and ``extent`` is the (min_x, max_x, min_y,
+             max_y) bounding box of the trajectory.
+    """
+    import json
+
+    x_off, y_off, _z_off = load_dem_offsets(dem_json_path)
+
+    with open(poses_path, "r", encoding="utf-8") as f:
+        poses = json.load(f)
+    images = poses["images"] if "images" in poses else poses
+
+    frame_drone: Dict[int, Tuple[float, float]] = {}
+    min_x, max_x = float("inf"), float("-inf")
+    min_y, max_y = float("inf"), float("-inf")
+
+    for frame_idx, img in enumerate(images):
+        loc = img.get("location")
+        if loc is None or len(loc) < 2:
+            continue
+        x = float(loc[0]) + x_off
+        y = float(loc[1]) + y_off
+        frame_drone[frame_idx] = (x, y)
+        min_x, max_x = min(min_x, x), max(max_x, x)
+        min_y, max_y = min(min_y, y), max(max_y, y)
+
+    if min_x == float("inf"):
+        return frame_drone, None
+    return frame_drone, (min_x, max_x, min_y, max_y)
 
 
 # ============================================================
@@ -482,6 +602,28 @@ def draw_map_panel(map_img, geo_dets, canvas_cfg, track_history, visible_tids, t
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
 
+# Distinct, fixed colour for the drone marker/trail (BGR).
+DRONE_COLOR = (0, 215, 255)  # amber
+
+
+def draw_drone_on_map(map_img, drone_pos, canvas_cfg, drone_history):
+    """Draws the drone trajectory trail and its current position on the map."""
+    if drone_pos is not None:
+        drone_history.append(world_to_canvas(drone_pos[0], drone_pos[1], canvas_cfg))
+
+    if len(drone_history) > 1:
+        cv2.polylines(map_img, [np.array(drone_history)], False, DRONE_COLOR, 1)
+
+    if drone_pos is not None:
+        px, py = drone_history[-1]
+        cv2.circle(map_img, (px, py), 6, DRONE_COLOR, -1)
+        cv2.circle(map_img, (px, py), 6, (0, 0, 0), 1)
+        cv2.line(map_img, (px - 9, py), (px + 9, py), DRONE_COLOR, 1)
+        cv2.line(map_img, (px, py - 9), (px, py + 9), DRONE_COLOR, 1)
+        cv2.putText(map_img, "Drone", (px + 8, py - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, DRONE_COLOR, 1, cv2.LINE_AA)
+
+
 # ============================================================
 # 5. MAIN
 # ============================================================
@@ -490,10 +632,22 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--video", required=True, help="Source video file.")
-    p.add_argument("--tracking-dir", required=True,
-                   help="Directory holding the TRex *_id<N>.npz tracklets.")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--tracking-dir",
+                     help="Directory holding the TRex *_id<N>.npz tracklets (pose key-points).")
+    src.add_argument("--pixel-tracks-csv",
+                     help="Pixel-space MOT CSV instead of TRex tracklets "
+                          "(e.g. tracks_pixel_w/tracks_pixel.csv from trex_to_bambi). "
+                          "Bounding boxes only, no pose key-points.")
     p.add_argument("--tracks-csv", required=True,
                    help="Geo-referenced tracks CSV (e.g. tracks_w/tracks.csv from trex_to_bambi).")
+    p.add_argument("--poses", default=None,
+                   help="Optional poses JSON (e.g. poses_w.json). When given, the drone "
+                        "position is drawn on the map. Requires --dem-json for the origin offset.")
+    p.add_argument("--dem-json", default=None,
+                   help="DEM metadata JSON (e.g. flat_surface_dem.json) providing the origin "
+                        "offset used to place the (relative) poses into the tracks CRS. "
+                        "Required when --poses is given.")
     p.add_argument("--output", default=None,
                    help="Output video path. Defaults to <video_dir>/<stem>_trex_vis.mp4")
     p.add_argument("--epsg", type=int, default=32643,
@@ -510,8 +664,6 @@ def parse_args():
                    help="Optional subset of track ids to display.")
     p.add_argument("--max-frames", type=int, default=None, help="Stop after N frames (debugging).")
     p.add_argument("--map-cache", default=None, help="Directory to cache downloaded map tiles.")
-    p.add_argument("--bambi-path", default=None,
-                   help="Path to a local bambi_detection checkout (for the FFMPEG writer).")
     return p.parse_args()
 
 
@@ -535,15 +687,35 @@ def main():
 
     print(f"Video      : {video_path}  ({video_w}x{video_h} @ {src_fps:.1f} fps)")
 
-    # --- Load tracking data ---
-    frame_dets, n_tracks = load_trex_tracklets(args.tracking_dir, video_stem, video_w, video_h)
-    print(f"TRex       : {n_tracks} tracklets, detections on {len(frame_dets)} frames")
+    # --- Load tracking data (TRex tracklets or pixel-space MOT CSV) ---
+    if args.pixel_tracks_csv:
+        frame_dets, n_tracks = load_pixel_tracks(args.pixel_tracks_csv)
+        print(f"MOT pixel  : {n_tracks} tracks, detections on {len(frame_dets)} frames "
+              f"({os.path.basename(args.pixel_tracks_csv)})")
+    else:
+        frame_dets, n_tracks = load_trex_tracklets(args.tracking_dir, video_stem, video_w, video_h)
+        print(f"TRex       : {n_tracks} tracklets, detections on {len(frame_dets)} frames")
 
     frame_geo, extent = load_geo_tracks(args.tracks_csv)
     if extent is None:
         raise RuntimeError(f"No geo-referenced tracks found in {args.tracks_csv}")
     print(f"Geo tracks : {len(frame_geo)} frames, extent E[{extent[0]:.1f},{extent[1]:.1f}] "
           f"N[{extent[2]:.1f},{extent[3]:.1f}]")
+
+    # --- Optional drone positions from poses JSON ---
+    frame_drone: Dict[int, Tuple[float, float]] = {}
+    if args.poses:
+        if not args.dem_json:
+            raise ValueError("--poses requires --dem-json (for the origin offset).")
+        print("Drone      : loading poses ...")
+        frame_drone, drone_extent = load_drone_positions(args.poses, args.dem_json)
+        print(f"Drone      : {len(frame_drone)} positions")
+        if drone_extent is not None:
+            # Grow the map extent so the whole drone trajectory stays visible.
+            extent = (
+                min(extent[0], drone_extent[0]), max(extent[1], drone_extent[1]),
+                min(extent[2], drone_extent[2]), max(extent[3], drone_extent[3]),
+            )
 
     # --- Map canvas setup ---
     draw_scale = args.display_width / video_w
@@ -578,6 +750,7 @@ def main():
         cv2.namedWindow("TRex Vis", cv2.WINDOW_NORMAL)
 
     track_history: Dict[int, list] = defaultdict(list)
+    drone_history: list = []
 
     def frame_generator():
         frame_idx = 0
@@ -601,6 +774,8 @@ def main():
             visible_tids: set = set()
             draw_map_panel(map_img, frame_geo.get(frame_idx, []), canvas_cfg,
                            track_history, visible_tids, track_ids=track_ids)
+            if frame_drone:
+                draw_drone_on_map(map_img, frame_drone.get(frame_idx), canvas_cfg, drone_history)
             draw_axes_on_canvas(map_img, canvas_cfg)
             cv2.putText(map_img, f"Geo tracks (EPSG:{args.epsg})", (10, map_size - 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -628,7 +803,7 @@ def main():
 
     try:
         if create_video:
-            writer = make_ffmpeg_writer(args.bambi_path)
+            writer = make_ffmpeg_writer()
             print(f"Writing video -> {out_path}")
             if writer is not None:
                 writer.write(out_path, frame_generator(), target_fps=out_fps)

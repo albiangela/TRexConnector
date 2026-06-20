@@ -2,8 +2,9 @@
 Convert TRex bounding-box tracklets (.npz) into
 
 1. a flat detection file            -> detections.txt
-2. a geo-referenced detection file  -> georeferenced.txt   (global x/y/z)
-3. a geo-referenced MOT track file  -> tracks.csv
+2. a pixel-space (distorted) MOT track file -> tracks_pixel.csv (raw x1/y1/x2/y2)
+3. a geo-referenced detection file  -> georeferenced.txt   (global x/y/z)
+4. a geo-referenced MOT track file  -> tracks.csv
 
 The geo-referencing replicates the bambi_detection projection pipeline
 (``label_to_world_coordinates`` against the digital elevation model, using the
@@ -31,43 +32,17 @@ import argparse
 import glob
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-def _ensure_bambi_importable() -> None:
-    """
-    Make ``bambi_detection`` importable.
-
-    The bambi_detection repository uses a ``src/`` layout and currently ships no
-    packaging metadata, so a plain ``pip install git+...`` may not expose it on
-    the path.  As a fallback, set the ``BAMBI_DETECTION_PATH`` environment
-    variable (or pass ``--bambi-path``) to a local clone of the repository.
-    """
-    candidate = os.environ.get("BAMBI_DETECTION_PATH")
-    # also honour --bambi-path before argparse runs, so the import below succeeds
-    if "--bambi-path" in sys.argv:
-        candidate = sys.argv[sys.argv.index("--bambi-path") + 1]
-    if candidate and os.path.isdir(candidate):
-        for extra in (candidate, os.path.join(candidate, "src")):
-            if os.path.isdir(extra) and extra not in sys.path:
-                sys.path.insert(0, extra)
-
-
-_ensure_bambi_importable()
-
-from alfspy.core.rendering import Camera, Resolution  # noqa: E402
-from alfspy.render.render import read_gltf  # noqa: E402
-from pyrr import Quaternion, Vector3  # noqa: E402
-from trimesh import Trimesh  # noqa: E402
-
-try:  # repo checkout (src/ layout), or BAMBI_DETECTION_PATH pointing at the repo root
-    from src.bambi.util.projection_util import label_to_world_coordinates  # noqa: E402
-except ImportError:  # installed as a package, or BAMBI_DETECTION_PATH/.../src on the path
-    from bambi.util.projection_util import label_to_world_coordinates  # noqa: E402
+from alfspy.core.rendering import Camera, Resolution
+from alfspy.render.render import read_gltf
+from bambi.util.projection_util import label_to_world_coordinates
+from pyrr import Quaternion, Vector3
+from trimesh import Trimesh
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +162,30 @@ def write_detections_txt(detections: List[Detection], out_path: str) -> None:
                 f"{d.confidence:.4f} {d.class_id}\n"
             )
     print(f"Wrote {len(detections)} detections -> {out_path}")
+
+
+# --------------------------------------------------------------------------- #
+# Step 2: pixel-space (distorted) MOT tracks
+# --------------------------------------------------------------------------- #
+def write_pixel_tracks_csv(detections: List[Detection], out_path: str) -> None:
+    """
+    Write the *distorted, non-geo-referenced* tracks in raw video-pixel space.
+
+    This is the 2D analogue of the geo-referenced ``tracks.csv``: same MOT-style
+    layout, but the bounding box is the raw (distorted) pixel box straight from
+    the npz tracklets, with no undistortion or world projection applied.
+
+    Columns: frame(8d), track_id, x1, y1, x2, y2, confidence, class_id, flag
+    (flag is always 0 = real detection, matching tracks.csv).
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        for d in detections:
+            f.write(
+                f"{d.frame:08d},{d.track_id},{d.x1:.6f},{d.y1:.6f},"
+                f"{d.x2:.6f},{d.y2:.6f},{d.confidence:.6f},{d.class_id},0\n"
+            )
+    print(f"Wrote {len(detections)} pixel-space track rows -> {out_path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -372,9 +371,6 @@ def parse_args(argv=None):
     p.add_argument("--out-dir", default=_default(base, "qgis4"),
                    help="Output folder; detections/georeferenced/tracks subfolders are created")
 
-    p.add_argument("--bambi-path", default=None,
-                   help="Path to a local bambi_detection checkout (alternative to the "
-                        "BAMBI_DETECTION_PATH env var) if it is not importable as a package")
     p.add_argument("--no-undistort", action="store_true",
                    help="Do not undistort detections (use only if they already live in "
                         "the pose-frame pixel space)")
@@ -394,6 +390,7 @@ def main(argv=None) -> None:
     args = parse_args(argv)
 
     det_path = _default(args.out_dir, "detections_w", "detections.txt")
+    pixel_tracks_path = _default(args.out_dir, "tracks_pixel_w", "tracks_pixel.csv")
     georef_path = _default(args.out_dir, "georeferenced_w", "georeferenced.txt")
     tracks_path = _default(args.out_dir, "tracks_w", "tracks.csv")
 
@@ -402,6 +399,7 @@ def main(argv=None) -> None:
     detections, raw_size = read_npz_tracklets(args.npz_dir, track_id_offset=args.track_id_offset)
     print(f"   {len(detections)} detections, raw video size {raw_size}")
     write_detections_txt(detections, det_path)
+    write_pixel_tracks_csv(detections, pixel_tracks_path)
 
     # --- prepare geo-referencing ---------------------------------------------------
     print("2. Loading DEM + poses")
