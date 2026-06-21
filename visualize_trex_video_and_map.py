@@ -46,8 +46,8 @@ Example:
 
       python visualize_trex_video_and_map.py
       --video            "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/qgis5/poses_w.mp4"
-      --pixel-tracks-csv "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/trex13/tracks_pixel_w/tracks_pixel.csv"
-      --tracks-csv       "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/trex13/tracks_w/tracks.csv"
+      --pixel-tracks-csv "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/trex14/tracks_pixel_w/tracks_pixel_undistorted.csv"
+      --tracks-csv       "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/trex14/tracks_w/tracks.csv"
       --poses            "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/qgis5/poses_w.json"
       --dem-json         "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/qgis5/flat_surface_dem.json"
       --output           "C:/Users/P41743/Desktop/lndf/Angela/test-data/pink/qgis5/poses_w_vis.mp4"

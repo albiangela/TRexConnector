@@ -14,23 +14,32 @@ afterwards use the TRexConnector to geo-reference detections and tracks.
 
 ```
 TRex (.npz tracklets)  ──►  TRexConnector  ──►  detections.txt
+                                            ──►  tracks_pixel.csv   (pixel-space MOT)
                                             ──►  georeferenced.txt  (global x/y/z)
                                             ──►  tracks.csv         (geo-referenced MOT)
 ```
 
 ## What it produces
 
-For a folder of TRex `*.npz` tracklets the script writes three files:
+For a folder of TRex `*.npz` tracklets the script writes, under `--out-dir`:
 
 1. **`detections_w/detections.txt`** — flat per-frame detections
    `# frame x1 y1 x2 y2 confidence class_id`.
    Each frame's bounding box is the axis-aligned box spanning the tracklet's `poseX*/poseY*`
    points.
-2. **`georeferenced_w/georeferenced.txt`** — the same detections projected onto the DEM
+2. **`tracks_pixel_w/tracks_pixel.csv`** — pixel-space (non-geo-referenced) MOT in the raw
+   video pixel space:
+   `frame(8-digit),track_id,x1,y1,x2,y2,confidence,class_id,flag`.
+   When undistortion is enabled, **`tracks_pixel_w/tracks_pixel_undistorted.csv`** is also
+   written, with the same columns but in the undistorted square-frame pixel space.
+3. **`georeferenced_w/georeferenced.txt`** — the detections projected onto the DEM
    `# idx frame min_x min_y min_z max_x max_y max_z confidence class_id`,
    in the DEM CRS (world = mesh-local + DEM origin offset).
-3. **`tracks_w/tracks.csv`** — geo-referenced MOT, carrying each detection's track id:
+4. **`tracks_w/tracks.csv`** — geo-referenced MOT, carrying each detection's track id:
    `frame(8-digit),track_id,min_x,min_y,min_z,max_x,max_y,max_z,confidence,class_id,flag`.
+
+Steps 1 and 2 are independent of the DEM and always run; steps 3 and 4 require the DEM/poses
+inputs described below.
 
 ## How the geo-referencing works
 
@@ -76,10 +85,12 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-`requirements.txt` pulls BAMBI in directly from git:
+`requirements.txt` pulls BAMBI (and the `alfspy` rendering/geo library it builds on) directly
+from git, alongside the connector's runtime dependencies:
 
 ```
 bambi_detection @ git+https://github.com/bambi-eco/bambi_detection.git
+alfspy @ git+https://github.com/bambi-eco/alfs_py.git
 ```
 
 ## Usage
@@ -103,12 +114,12 @@ python trex_to_bambi.py \
 | `--poses` | Matched poses JSON (per-frame camera location/rotation/fovy). |
 | `--calib` | Camera calibration JSON (`mtx`/`dist`) used to undistort detections. |
 | `--correction` | Optional flight-specific correction JSON (`translation`/`rotation`). |
-| `--out-dir` | Output folder; `detections_w/`, `georeferenced_w/`, `tracks_w/` are created. |
+| `--mask` | Mask image, used to infer the undistorted frame resolution when undistortion is disabled. |
+| `--out-dir` | Output folder; `detections_w/`, `tracks_pixel_w/`, `georeferenced_w/`, `tracks_w/` are created. |
 | `--flat-surface-msl Z` | Project onto a flat plane at `Z` metres MSL instead of the DEM mesh. Use `0.0` for sea-surface surveys where the DEM is the seafloor. `--dem-glb` is not required when this is set. |
 | `--no-undistort` | Skip undistortion (detections already in pose-frame space). |
 | `--track-id-offset` | Added to every track id (use `1` for 1-based MOT ids). |
 | `--input-resolution W H` | Override the projection input resolution. |
-| `--bambi-path` | Path to a local `bambi_detection` checkout (see note above). |
 
 ## Requirements on the input data
 
@@ -123,11 +134,15 @@ independent of the DEM and always works.)
 `visualize_trex_video_and_map.py` is a companion tool for checking a run end to end. It
 renders a side-by-side video:
 
-- **Left — pixel space:** the original video with per-track bounding boxes (the axis-aligned
-  box spanning each tracklet's `poseX*/poseY*` points), ID labels, confidence and the pose
-  key-points.
+- **Left — pixel space:** the original video with per-track bounding boxes, ID labels and
+  confidence. The boxes come either from the TRex pose key-points (`--tracking-dir`, which
+  also draws the `poseX*/poseY*` key-points) or from a pixel-space MOT CSV
+  (`--pixel-tracks-csv`, e.g. the `tracks_pixel.csv` produced above) — exactly one of the two
+  is required.
 - **Right — geo space:** a 2D map of the geo-referenced `tracks.csv` (per-track boxes,
-  trajectory trails and axis ticks) over an optional satellite background.
+  trajectory trails and axis ticks) over an optional satellite background. When a poses JSON
+  (`--poses`) and its DEM metadata (`--dem-json`) are supplied, the drone's own position and
+  flight trail are drawn on the map too.
 
 The two panels stay in sync because the TRex tracklets and `tracks.csv` share the same frame
 indices and track ids.
@@ -150,10 +165,16 @@ opencv, and — for the satellite map — `pyproj` + `requests`.
 | Option | Description |
 | --- | --- |
 | `--video` | Source video file. |
-| `--tracking-dir` | Folder containing the TRex `*_id<N>.npz` tracklets. |
-| `--tracks-csv` | Geo-referenced tracks CSV (the `tracks_w/tracks.csv` produced above). |
-| `--epsg` | EPSG code of the `tracks.csv` coordinates, used to place the satellite map (e.g. `32643` for UTM 43N). |
+| `--tracking-dir` | Folder containing the TRex `*_id<N>.npz` tracklets (pose key-points). One of `--tracking-dir` / `--pixel-tracks-csv` is required. |
+| `--pixel-tracks-csv` | Pixel-space MOT CSV (e.g. `tracks_pixel_w/tracks_pixel.csv`) to drive the left panel instead of TRex tracklets. |
+| `--tracks-csv` | Geo-referenced tracks CSV (the `tracks_w/tracks.csv` produced above). Required. |
+| `--poses` | Optional poses JSON (e.g. `poses_w.json`); when given, the drone position is drawn on the map. Requires `--dem-json`. |
+| `--dem-json` | DEM metadata JSON providing the origin offset used to place the poses into the tracks CRS. |
+| `--epsg` | EPSG code of the `tracks.csv` coordinates, used to place the satellite map (default `32643`, UTM 43N). |
 | `--output` | Output video path (defaults to `<video_dir>/<stem>_trex_vis.mp4`). |
+| `--fps` | Output FPS (defaults to the source FPS). |
+| `--calib` | Camera calibration JSON (`mtx`/`dist`); undistorts pixel-space boxes before drawing. Use when the video is made from the QGIS-exported undistorted frames. |
+| `--raw-size W H` | Raw video dimensions (e.g. `5120 2700`). Required with `--calib` when using `--pixel-tracks-csv`; inferred from the NPZ files with `--tracking-dir`. |
 | `--track-ids` | Optional subset of track ids to display. |
 | `--no-map` | Disable the satellite background (no network needed). |
 | `--no-keypoints` | Draw only the bounding boxes, not the pose key-points. |
@@ -161,4 +182,3 @@ opencv, and — for the satellite map — `pyproj` + `requests`.
 | `--display-width` / `--map-size` | Video panel width and (square) map canvas size in pixels. |
 | `--max-frames` | Stop after N frames (useful for a quick check). |
 | `--map-cache` | Directory to cache downloaded map tiles. |
-| `--bambi-path` | Path to a local `bambi_detection` checkout (only needed for the FFMPEG writer). |
