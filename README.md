@@ -19,6 +19,33 @@ TRex (.npz tracklets)  ──►  TRexConnector  ──►  detections.txt
                                             ──►  tracks.csv         (geo-referenced MOT)
 ```
 
+## Overall workflow
+
+The connector is the last step of a larger pipeline. Before you can geo-reference a TRex run,
+you need a calibrated camera, a logged drone flight, a DEM, and the extracted frames/poses.
+A typical end-to-end monitoring workflow looks like this:
+
+1. **Calibrate your camera** *before any monitoring flight* — e.g. using
+   [camera-calib](https://github.com/bambi-eco/camera-calib) or [BAMBI QGIS plugin](https://github.com/bambi-eco/Bambi-QGIS). This produces the calibration
+   (`mtx`/`dist`) the connector needs to undistort detections.
+2. **Fly the drone with logging.** Record DJI's SRT logging plus AirData so the flight has the
+   telemetry the rest of the pipeline depends on. From this footage you can also run your
+   **TRex workflow** to detect and track the animals (producing the `*.npz` tracklets).
+3. **Get a digital elevation model (DEM).** Either download one from a public-domain source or
+   create your own via photogrammetry. For ocean-based workflows (e.g. shark monitoring), use
+   [`generate_flat_surface_dem.py`](https://github.com/bambi-eco/bambi_detection/blob/main/src/bambi/generate_flat_surface_dem.py)
+   to create a flat DEM (see also `--flat-surface-msl` as alternative below).
+4. **Extract the frames and poses** using
+   [`bambi_detection.py`](https://github.com/bambi-eco/bambi_detection/blob/main/src/bambi/bambi_detection.py)
+   or the [BAMBI QGIS plugin](https://github.com/bambi-eco/Bambi-QGIS).
+5. **Run `trex_to_bambi.py`.** At this point you have everything it needs — the poses file, the
+   DEM, the camera calibration, and the TRex tracklets — to geo-reference your detections and
+   tracks.
+
+If the drone's sensor data is partially off, the projection may be misaligned. In that case
+provide correction information via `--correction` (translation/rotation). The recommended way
+to determine these values is the BAMBI QGIS plugin and its correction tool.
+
 ## What it produces
 
 For a folder of TRex `*.npz` tracklets the script writes, under `--out-dir`:
