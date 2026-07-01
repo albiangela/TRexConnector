@@ -214,6 +214,7 @@ class Undistorter:
     """
 
     def __init__(self, calib_path: str, raw_size: Tuple[int, int],
+                 new_size: Optional[Tuple[int, int]] = None,
                  alpha: float = 0.5, center_principal_point: bool = True,
                  force_same_fov: bool = True):
         with open(calib_path, "r", encoding="utf-8") as f:
@@ -222,13 +223,22 @@ class Undistorter:
         self.dist = np.asarray(calib["dist"], dtype=float)
 
         w, h = raw_size
-        wh = min(w, h)
-        self.new_size = (wh, wh)  # bambi forces a square frame
+        # The undistortion target must equal the *extracted-frame* size the poses were
+        # built for. bambi keeps the full aspect ratio when preserve_aspect_ratio=True
+        # (e.g. 5120x2700) or forces a square (min(w,h)) otherwise. Pass new_size (the
+        # mask / extracted-frame resolution) to match; only fall back to square when
+        # unknown. Projecting a non-square frame as a forced square offsets/compresses
+        # the georeferenced boxes horizontally.
+        if new_size is None:
+            wh = min(w, h)
+            new_size = (wh, wh)
+        self.new_size = new_size
         ncm, _roi = cv2.getOptimalNewCameraMatrix(
             self.mtx, self.dist, (w, h), alpha, self.new_size,
             centerPrincipalPoint=center_principal_point,
         )
-        if force_same_fov:
+        # force_same_fov requires a square frame (see prepare_undistort assertion).
+        if force_same_fov and self.new_size[0] == self.new_size[1]:
             fxy = max(ncm[0, 0], ncm[1, 1])
             ncm[0, 0] = ncm[1, 1] = fxy
         self.new_camera_matrix = ncm
@@ -468,23 +478,33 @@ def main(argv=None) -> None:
 
     cor_rotation_eulers, cor_translation = load_correction(args.correction)
     print(cor_rotation_eulers, cor_translation)
+
+    # Determine the extracted-frame resolution the poses were built for (the mask shares
+    # the extracted-frame dimensions). --input-resolution overrides it. Used both as the
+    # undistortion target size and the projection input resolution so detections live in
+    # the exact pixel space of the poses.
+    extraction_size: Optional[Tuple[int, int]] = None
+    if args.input_resolution is not None:
+        extraction_size = (int(args.input_resolution[0]), int(args.input_resolution[1]))
+    elif os.path.exists(args.mask):
+        _m = cv2.imread(args.mask, cv2.IMREAD_UNCHANGED)
+        if _m is not None:
+            extraction_size = (_m.shape[1], _m.shape[0])
+
     undistorter = None
     if not args.no_undistort:
         if raw_size == (0, 0):
             raise ValueError("Raw video size unknown; cannot undistort. Pass --no-undistort "
                              "or ensure the npz files contain 'video_size'.")
-        undistorter = Undistorter(args.calib, raw_size)
+        undistorter = Undistorter(args.calib, raw_size, new_size=extraction_size)
         print(f"   Undistorting {raw_size} -> {undistorter.new_size} using {os.path.basename(args.calib)}")
         write_pixel_tracks_csv(detections, pixel_tracks_und_path, undistorter)
         print(f"   -> undistorted pixel tracks: {pixel_tracks_und_path}")
 
-    if args.input_resolution is not None:
-        input_resolution = Resolution(args.input_resolution[0], args.input_resolution[1])
+    if extraction_size is not None:
+        input_resolution = Resolution(extraction_size[0], extraction_size[1])
     elif undistorter is not None:
         input_resolution = undistorter.resolution
-    elif os.path.exists(args.mask):
-        mask = cv2.imread(args.mask, cv2.IMREAD_UNCHANGED)
-        input_resolution = Resolution(mask.shape[1], mask.shape[0])
     else:
         input_resolution = Resolution(raw_size[0], raw_size[1])
     print(f"   Projection input resolution: {input_resolution.width}x{input_resolution.height}")
