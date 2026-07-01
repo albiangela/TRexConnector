@@ -68,6 +68,12 @@ import cv2
 import json
 import numpy as np
 
+# cv2/numpy/BLAS each default to spawning up to nproc threads. When multiple such
+# processes run (even sequentially, back-to-back from a batch script), this can blow
+# up to 90+ live threads on a many-core machine and cause severe scheduling
+# contention instead of speedup. Respect OPENCV_NUM_THREADS if set, default to 4.
+cv2.setNumThreads(int(os.environ.get("OPENCV_NUM_THREADS", "4")))
+
 try:
     import requests
     from pyproj import CRS, Transformer
@@ -708,8 +714,10 @@ def parse_args():
                      help="Pixel-space MOT CSV instead of TRex tracklets "
                           "(e.g. tracks_pixel_w/tracks_pixel.csv from trex_to_bambi). "
                           "Bounding boxes only, no pose key-points.")
-    p.add_argument("--tracks-csv", required=True,
-                   help="Geo-referenced tracks CSV (e.g. tracks_w/tracks.csv from trex_to_bambi).")
+    p.add_argument("--tracks-csv", default=None,
+                   help="Geo-referenced tracks CSV (e.g. tracks_w/tracks.csv from trex_to_bambi). "
+                        "Optional: without it (e.g. before poses/georeferencing exist), the map "
+                        "panel is skipped and only the pixel-space video is produced.")
     p.add_argument("--poses", default=None,
                    help="Optional poses JSON (e.g. poses_w.json). When given, the drone "
                         "position is drawn on the map. Requires --dem-json for the origin offset.")
@@ -789,15 +797,21 @@ def main():
               f"using {os.path.basename(args.calib)}")
         undistort_frame_dets(frame_dets, undistorter)
 
-    frame_geo, extent = load_geo_tracks(args.tracks_csv)
-    if extent is None:
-        raise RuntimeError(f"No geo-referenced tracks found in {args.tracks_csv}")
-    print(f"Geo tracks : {len(frame_geo)} frames, extent E[{extent[0]:.1f},{extent[1]:.1f}] "
-          f"N[{extent[2]:.1f},{extent[3]:.1f}]")
+    frame_geo: Dict[int, list] = {}
+    extent = None
+    if args.tracks_csv:
+        frame_geo, extent = load_geo_tracks(args.tracks_csv)
+        if extent is None:
+            raise RuntimeError(f"No geo-referenced tracks found in {args.tracks_csv}")
+        print(f"Geo tracks : {len(frame_geo)} frames, extent E[{extent[0]:.1f},{extent[1]:.1f}] "
+              f"N[{extent[2]:.1f},{extent[3]:.1f}]")
+    else:
+        print("Geo tracks : none (--tracks-csv not given) - map panel disabled, "
+              "writing pixel-space video only.")
 
     # --- Optional drone positions from poses JSON ---
     frame_drone: Dict[int, Tuple[float, float]] = {}
-    if args.poses:
+    if args.poses and extent is not None:
         if not args.dem_json:
             raise ValueError("--poses requires --dem-json (for the origin offset).")
         print("Drone      : loading poses ...")
@@ -809,28 +823,33 @@ def main():
                 min(extent[0], drone_extent[0]), max(extent[1], drone_extent[1]),
                 min(extent[2], drone_extent[2]), max(extent[3], drone_extent[3]),
             )
+    elif args.poses:
+        print("Drone      : --poses given but no --tracks-csv - skipping drone overlay "
+              "(there is no map panel to draw it on).")
 
     # --- Map canvas setup ---
     draw_scale = args.display_width / video_w
     disp_h = int(round(video_h * draw_scale))
-
     map_size = args.map_size
-    margin = 60
-    padded_extent = pad_extent_to_match_aspect_ratio(extent, map_size, map_size, margin)
-    canvas_cfg = make_global_canvas(padded_extent, map_size, map_size, margin)
 
+    canvas_cfg = None
     map_bg = None
-    if not args.no_map:
-        if not _HAS_MAP_DEPS:
-            print("Map deps (requests/pyproj) unavailable - skipping satellite background.")
-        else:
-            print("Downloading satellite background ...")
-            prov = MapTileProvider(MapTileProvider.ESRI_SATELLITE, args.map_cache, utm_epsg=args.epsg)
-            map_bg = prov.get_map_background(padded_extent, canvas_cfg)
-            if map_bg is not None:
-                map_bg = (map_bg * 0.55).astype(np.uint8)
+    if extent is not None:
+        margin = 60
+        padded_extent = pad_extent_to_match_aspect_ratio(extent, map_size, map_size, margin)
+        canvas_cfg = make_global_canvas(padded_extent, map_size, map_size, margin)
+
+        if not args.no_map:
+            if not _HAS_MAP_DEPS:
+                print("Map deps (requests/pyproj) unavailable - skipping satellite background.")
             else:
-                print("Could not build map background (offline?) - using blank canvas.")
+                print("Downloading satellite background ...")
+                prov = MapTileProvider(MapTileProvider.ESRI_SATELLITE, args.map_cache, utm_epsg=args.epsg)
+                map_bg = prov.get_map_background(padded_extent, canvas_cfg)
+                if map_bg is not None:
+                    map_bg = (map_bg * 0.55).astype(np.uint8)
+                else:
+                    print("Could not build map background (offline?) - using blank canvas.")
 
     # --- Output path ---
     out_path = args.output
@@ -861,22 +880,25 @@ def main():
             cv2.putText(vid_panel, "Video (pixel space)", (10, disp_h - 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # --- Map panel (geo space) ---
-            map_img = map_bg.copy() if map_bg is not None else \
-                np.zeros((map_size, map_size, 3), dtype=np.uint8)
-            visible_tids: set = set()
-            draw_map_panel(map_img, frame_geo.get(frame_idx, []), canvas_cfg,
-                           track_history, visible_tids, track_ids=track_ids)
-            if frame_drone:
-                draw_drone_on_map(map_img, frame_drone.get(frame_idx), canvas_cfg, drone_history)
-            draw_axes_on_canvas(map_img, canvas_cfg)
-            cv2.putText(map_img, f"Geo tracks (EPSG:{args.epsg})", (10, map_size - 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            # --- Map panel (geo space), only when geo-referenced tracks are available ---
+            if canvas_cfg is not None:
+                map_img = map_bg.copy() if map_bg is not None else \
+                    np.zeros((map_size, map_size, 3), dtype=np.uint8)
+                visible_tids: set = set()
+                draw_map_panel(map_img, frame_geo.get(frame_idx, []), canvas_cfg,
+                               track_history, visible_tids, track_ids=track_ids)
+                if frame_drone:
+                    draw_drone_on_map(map_img, frame_drone.get(frame_idx), canvas_cfg, drone_history)
+                draw_axes_on_canvas(map_img, canvas_cfg)
+                cv2.putText(map_img, f"Geo tracks (EPSG:{args.epsg})", (10, map_size - 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-            # --- Combine side by side (match heights) ---
-            map_scale = disp_h / map_size
-            map_resized = cv2.resize(map_img, (int(map_size * map_scale), disp_h))
-            combined = np.hstack([vid_panel, map_resized])
+                # --- Combine side by side (match heights) ---
+                map_scale = disp_h / map_size
+                map_resized = cv2.resize(map_img, (int(map_size * map_scale), disp_h))
+                combined = np.hstack([vid_panel, map_resized])
+            else:
+                combined = vid_panel
 
             # libx264/yuv420p requires even width & height.
             ch, cw = combined.shape[:2]

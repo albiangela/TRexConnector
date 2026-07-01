@@ -38,6 +38,12 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+# cv2/numpy/BLAS each default to spawning up to nproc threads. When multiple such
+# processes run (even sequentially, back-to-back from a batch script), this can blow
+# up to 90+ live threads on a many-core machine and cause severe scheduling
+# contention instead of speedup. Respect OPENCV_NUM_THREADS if set, default to 4.
+cv2.setNumThreads(int(os.environ.get("OPENCV_NUM_THREADS", "4")))
+
 from alfspy.core.rendering import Camera, Resolution
 from alfspy.render.render import read_gltf
 from bambi.util.projection_util import label_to_world_coordinates
