@@ -384,10 +384,16 @@ def parse_args(argv=None):
     p.add_argument("--dem-glb", default=_default(qgis, "DJI_202403071703_002_athtongue_DEM.glb"),
                    help="Digital elevation model mesh (GLTF/GLB). "
                         "Not required when --flat-surface-msl is set.")
-    p.add_argument("--dem-json", default=_default(qgis, "DJI_202403071703_002_athtongue_DEM.json"),
-                   help="DEM metadata json (provides the origin offsets / CRS)")
-    p.add_argument("--poses", default=_default(qgis, "poses_w.json"),
-                   help="Matched poses json (per-frame camera location/rotation/fovy)")
+    p.add_argument("--dem-json", default=None,
+                   help="DEM metadata json (provides the origin offsets / CRS). "
+                        "Optional when --flat-surface-msl is set: the origin then "
+                        "defaults to (0, 0, 0), i.e. coordinates stay in the local "
+                        "pose frame instead of the DEM CRS.")
+    p.add_argument("--poses", default=None,
+                   help="Matched poses json (per-frame camera location/rotation/fovy), "
+                        "produced by bambi_detection.py or the BAMBI QGIS plugin. "
+                        "Optional: without it, only the pixel-space detections/tracks "
+                        "(step 1) are written and georeferencing is skipped.")
     p.add_argument("--calib", default=r"C:/Users/P41743/Desktop/lndf/M30T/W_calib.json",
                    help="Camera calibration json (mtx/dist) for undistorting detections")
     p.add_argument("--correction", default=None,
@@ -429,31 +435,69 @@ def main(argv=None) -> None:
     write_detections_txt(detections, det_path)
     write_pixel_tracks_csv(detections, pixel_tracks_path)
 
+    # Determine the extracted-frame resolution the poses were built for (the mask shares
+    # the extracted-frame dimensions). --input-resolution overrides it. Used both as the
+    # undistortion target size and the projection input resolution so detections live in
+    # the exact pixel space of the poses. Independent of --poses, so it runs regardless.
+    extraction_size: Optional[Tuple[int, int]] = None
+    if args.input_resolution is not None:
+        extraction_size = (int(args.input_resolution[0]), int(args.input_resolution[1]))
+    elif os.path.exists(args.mask):
+        _m = cv2.imread(args.mask, cv2.IMREAD_UNCHANGED)
+        if _m is not None:
+            extraction_size = (_m.shape[1], _m.shape[0])
+
+    undistorter = None
+    if not args.no_undistort:
+        if raw_size == (0, 0):
+            raise ValueError("Raw video size unknown; cannot undistort. Pass --no-undistort "
+                             "or ensure the npz files contain 'video_size'.")
+        undistorter = Undistorter(args.calib, raw_size, new_size=extraction_size)
+        print(f"   Undistorting {raw_size} -> {undistorter.new_size} using {os.path.basename(args.calib)}")
+        write_pixel_tracks_csv(detections, pixel_tracks_und_path, undistorter)
+        print(f"   -> undistorted pixel tracks: {pixel_tracks_und_path}")
+
+    if args.poses is None:
+        print("2. No --poses given: skipping georeferencing. Generate poses with "
+              "bambi_detection.py or the BAMBI QGIS plugin, then re-run with --poses "
+              "to produce the georeferenced.txt / tracks.csv outputs.")
+        print("Done.")
+        return
+
     # --- prepare geo-referencing ---------------------------------------------------
     print("2. Loading DEM + poses")
-    with open(args.dem_json, "r", encoding="utf-8") as f:
-        dem_meta = json.load(f)
-    offsets = tuple(float(v) for v in dem_meta["origin"])
-    # Detect geographic (degree) origin and convert to UTM — same fix as in run_export_geotiffs.
-    # Without this, a geographic JSON gives z_off=-103.61 (DEM min) instead of -98.46 (origin
-    # altitude), causing a ~5 m z-plane difference vs the GeoTIFF export and lateral box drift.
-    x_off, y_off, z_off = offsets
-    if abs(x_off) <= 180 and abs(y_off) <= 90:
-        try:
-            from pyproj import Transformer
-            wgs84 = dem_meta.get("origin_wgs84", {})
-            lat = float(wgs84.get("latitude", y_off))
-            lon = float(wgs84.get("longitude", x_off))
-            z_off = float(wgs84.get("altitude", z_off))
-            crs_str = str(dem_meta.get("crs", "EPSG:32633"))
-            epsg_num = int(crs_str.split(":")[-1]) if "EPSG:" in crs_str else 32633
-            _t = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg_num}", always_xy=True)
-            x_off, y_off = _t.transform(lon, lat)
-            offsets = (x_off, y_off, z_off)
-            print(f"   Geographic origin auto-converted to UTM: ({x_off:.2f}, {y_off:.2f})")
-        except Exception as _e:
-            print(f"   Warning: origin conversion failed ({_e}). Coordinates may be wrong.")
-    print(f"   DEM CRS {dem_meta.get('crs')}, origin offset {offsets}")
+    if args.dem_json is None:
+        if args.flat_surface_msl is None:
+            raise ValueError("--dem-json is required unless --flat-surface-msl is set "
+                              "(the DEM mesh needs the origin offset to be placed in the "
+                              "world CRS).")
+        offsets = (0.0, 0.0, 0.0)
+        print("   No --dem-json given: using origin offset (0, 0, 0). Output coordinates "
+              "stay in the local pose frame, not the DEM CRS.")
+    else:
+        with open(args.dem_json, "r", encoding="utf-8") as f:
+            dem_meta = json.load(f)
+        offsets = tuple(float(v) for v in dem_meta["origin"])
+        # Detect geographic (degree) origin and convert to UTM — same fix as in run_export_geotiffs.
+        # Without this, a geographic JSON gives z_off=-103.61 (DEM min) instead of -98.46 (origin
+        # altitude), causing a ~5 m z-plane difference vs the GeoTIFF export and lateral box drift.
+        x_off, y_off, z_off = offsets
+        if abs(x_off) <= 180 and abs(y_off) <= 90:
+            try:
+                from pyproj import Transformer
+                wgs84 = dem_meta.get("origin_wgs84", {})
+                lat = float(wgs84.get("latitude", y_off))
+                lon = float(wgs84.get("longitude", x_off))
+                z_off = float(wgs84.get("altitude", z_off))
+                crs_str = str(dem_meta.get("crs", "EPSG:32633"))
+                epsg_num = int(crs_str.split(":")[-1]) if "EPSG:" in crs_str else 32633
+                _t = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg_num}", always_xy=True)
+                x_off, y_off = _t.transform(lon, lat)
+                offsets = (x_off, y_off, z_off)
+                print(f"   Geographic origin auto-converted to UTM: ({x_off:.2f}, {y_off:.2f})")
+            except Exception as _e:
+                print(f"   Warning: origin conversion failed ({_e}). Coordinates may be wrong.")
+        print(f"   DEM CRS {dem_meta.get('crs')}, origin offset {offsets}")
 
     with open(args.poses, "r", encoding="utf-8") as f:
         poses = json.load(f)
@@ -478,28 +522,6 @@ def main(argv=None) -> None:
 
     cor_rotation_eulers, cor_translation = load_correction(args.correction)
     print(cor_rotation_eulers, cor_translation)
-
-    # Determine the extracted-frame resolution the poses were built for (the mask shares
-    # the extracted-frame dimensions). --input-resolution overrides it. Used both as the
-    # undistortion target size and the projection input resolution so detections live in
-    # the exact pixel space of the poses.
-    extraction_size: Optional[Tuple[int, int]] = None
-    if args.input_resolution is not None:
-        extraction_size = (int(args.input_resolution[0]), int(args.input_resolution[1]))
-    elif os.path.exists(args.mask):
-        _m = cv2.imread(args.mask, cv2.IMREAD_UNCHANGED)
-        if _m is not None:
-            extraction_size = (_m.shape[1], _m.shape[0])
-
-    undistorter = None
-    if not args.no_undistort:
-        if raw_size == (0, 0):
-            raise ValueError("Raw video size unknown; cannot undistort. Pass --no-undistort "
-                             "or ensure the npz files contain 'video_size'.")
-        undistorter = Undistorter(args.calib, raw_size, new_size=extraction_size)
-        print(f"   Undistorting {raw_size} -> {undistorter.new_size} using {os.path.basename(args.calib)}")
-        write_pixel_tracks_csv(detections, pixel_tracks_und_path, undistorter)
-        print(f"   -> undistorted pixel tracks: {pixel_tracks_und_path}")
 
     if extraction_size is not None:
         input_resolution = Resolution(extraction_size[0], extraction_size[1])
