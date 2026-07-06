@@ -248,6 +248,8 @@ class Undistorter:
             fxy = max(ncm[0, 0], ncm[1, 1])
             ncm[0, 0] = ncm[1, 1] = fxy
         self.new_camera_matrix = ncm
+        self._map1 = None
+        self._map2 = None
 
     @property
     def resolution(self) -> Resolution:
@@ -258,6 +260,16 @@ class Undistorter:
         pts = np.asarray(pts_xy, dtype=np.float32).reshape(-1, 1, 2)
         out = cv2.undistortPoints(pts, self.mtx, self.dist, P=self.new_camera_matrix)
         return out.reshape(-1, 2)
+
+    def image(self, frame: np.ndarray) -> np.ndarray:
+        """Undistort a full raw-video frame into the same pixel space as
+        ``points()``. The remap tables only depend on the calibration (not the
+        frame), so they're built once and reused for every subsequent call."""
+        if self._map1 is None:
+            self._map1, self._map2 = cv2.initUndistortRectifyMap(
+                self.mtx, self.dist, None, self.new_camera_matrix, self.new_size, cv2.CV_16SC2,
+            )
+        return cv2.remap(frame, self._map1, self._map2, interpolation=cv2.INTER_LINEAR)
 
 
 # --------------------------------------------------------------------------- #
@@ -274,6 +286,65 @@ def get_camera_for_frame(poses: dict, frame_idx: int,
     ) * -1
     rotation = Quaternion.from_eulers(rotation_eulers)
     return Camera(fovy=fovy, aspect_ratio=aspect_ratio, position=position, rotation=rotation)
+
+
+def load_projection_mesh(
+    dem_json: Optional[str], dem_glb: Optional[str], flat_surface_msl: Optional[float]
+) -> Tuple[Trimesh, Tuple[float, float, float]]:
+    """Build the projection mesh (flat surface or DEM) and the world-CRS origin
+    offset. Shared by every script that geo-references TRex pixel coordinates."""
+    if dem_json is None:
+        if flat_surface_msl is None:
+            raise ValueError("--dem-json is required unless --flat-surface-msl is set "
+                              "(the DEM mesh needs the origin offset to be placed in the "
+                              "world CRS).")
+        offsets = (0.0, 0.0, 0.0)
+        print("   No --dem-json given: using origin offset (0, 0, 0). Output coordinates "
+              "stay in the local pose frame, not the DEM CRS.")
+    else:
+        with open(dem_json, "r", encoding="utf-8") as f:
+            dem_meta = json.load(f)
+        offsets = tuple(float(v) for v in dem_meta["origin"])
+        # Detect geographic (degree) origin and convert to UTM — same fix as in run_export_geotiffs.
+        # Without this, a geographic JSON gives z_off=-103.61 (DEM min) instead of -98.46 (origin
+        # altitude), causing a ~5 m z-plane difference vs the GeoTIFF export and lateral box drift.
+        x_off, y_off, z_off = offsets
+        if abs(x_off) <= 180 and abs(y_off) <= 90:
+            try:
+                from pyproj import Transformer
+                wgs84 = dem_meta.get("origin_wgs84", {})
+                lat = float(wgs84.get("latitude", y_off))
+                lon = float(wgs84.get("longitude", x_off))
+                z_off = float(wgs84.get("altitude", z_off))
+                crs_str = str(dem_meta.get("crs", "EPSG:32633"))
+                epsg_num = int(crs_str.split(":")[-1]) if "EPSG:" in crs_str else 32633
+                _t = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg_num}", always_xy=True)
+                x_off, y_off = _t.transform(lon, lat)
+                offsets = (x_off, y_off, z_off)
+                print(f"   Geographic origin auto-converted to UTM: ({x_off:.2f}, {y_off:.2f})")
+            except Exception as _e:
+                print(f"   Warning: origin conversion failed ({_e}). Coordinates may be wrong.")
+        print(f"   DEM CRS {dem_meta.get('crs')}, origin offset {offsets}")
+
+    if flat_surface_msl is not None:
+        z_off = float(offsets[2])
+        z_local = flat_surface_msl - z_off
+        half = 1_000_000.0
+        verts = np.array([
+            [-half, -half, z_local],
+            [ half, -half, z_local],
+            [ half,  half, z_local],
+            [-half,  half, z_local],
+        ], dtype=np.float32)
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+        tri_mesh = Trimesh(vertices=verts, faces=faces)
+        print(f"   Flat-surface projection: {flat_surface_msl:.1f} m MSL "
+              f"(= {z_local:.2f} m local). DEM mesh skipped.")
+    else:
+        mesh_data, _texture = read_gltf(dem_glb)
+        tri_mesh = Trimesh(vertices=mesh_data.vertices, faces=mesh_data.indices)
+
+    return tri_mesh, offsets
 
 
 def load_correction(path: Optional[str]) -> Tuple[Vector3, Vector3]:
@@ -472,59 +543,10 @@ def main(argv=None) -> None:
 
     # --- prepare geo-referencing ---------------------------------------------------
     print("2. Loading DEM + poses")
-    if args.dem_json is None:
-        if args.flat_surface_msl is None:
-            raise ValueError("--dem-json is required unless --flat-surface-msl is set "
-                              "(the DEM mesh needs the origin offset to be placed in the "
-                              "world CRS).")
-        offsets = (0.0, 0.0, 0.0)
-        print("   No --dem-json given: using origin offset (0, 0, 0). Output coordinates "
-              "stay in the local pose frame, not the DEM CRS.")
-    else:
-        with open(args.dem_json, "r", encoding="utf-8") as f:
-            dem_meta = json.load(f)
-        offsets = tuple(float(v) for v in dem_meta["origin"])
-        # Detect geographic (degree) origin and convert to UTM — same fix as in run_export_geotiffs.
-        # Without this, a geographic JSON gives z_off=-103.61 (DEM min) instead of -98.46 (origin
-        # altitude), causing a ~5 m z-plane difference vs the GeoTIFF export and lateral box drift.
-        x_off, y_off, z_off = offsets
-        if abs(x_off) <= 180 and abs(y_off) <= 90:
-            try:
-                from pyproj import Transformer
-                wgs84 = dem_meta.get("origin_wgs84", {})
-                lat = float(wgs84.get("latitude", y_off))
-                lon = float(wgs84.get("longitude", x_off))
-                z_off = float(wgs84.get("altitude", z_off))
-                crs_str = str(dem_meta.get("crs", "EPSG:32633"))
-                epsg_num = int(crs_str.split(":")[-1]) if "EPSG:" in crs_str else 32633
-                _t = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg_num}", always_xy=True)
-                x_off, y_off = _t.transform(lon, lat)
-                offsets = (x_off, y_off, z_off)
-                print(f"   Geographic origin auto-converted to UTM: ({x_off:.2f}, {y_off:.2f})")
-            except Exception as _e:
-                print(f"   Warning: origin conversion failed ({_e}). Coordinates may be wrong.")
-        print(f"   DEM CRS {dem_meta.get('crs')}, origin offset {offsets}")
+    tri_mesh, offsets = load_projection_mesh(args.dem_json, args.dem_glb, args.flat_surface_msl)
 
     with open(args.poses, "r", encoding="utf-8") as f:
         poses = json.load(f)
-
-    if args.flat_surface_msl is not None:
-        z_off = float(offsets[2])
-        z_local = args.flat_surface_msl - z_off
-        half = 1_000_000.0
-        verts = np.array([
-            [-half, -half, z_local],
-            [ half, -half, z_local],
-            [ half,  half, z_local],
-            [-half,  half, z_local],
-        ], dtype=np.float32)
-        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
-        tri_mesh = Trimesh(vertices=verts, faces=faces)
-        print(f"   Flat-surface projection: {args.flat_surface_msl:.1f} m MSL "
-              f"(= {z_local:.2f} m local). DEM mesh skipped.")
-    else:
-        mesh_data, _texture = read_gltf(args.dem_glb)
-        tri_mesh = Trimesh(vertices=mesh_data.vertices, faces=mesh_data.indices)
 
     cor_rotation_eulers, cor_translation = load_correction(args.correction)
     print(cor_rotation_eulers, cor_translation)

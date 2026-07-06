@@ -81,6 +81,13 @@ try:
 except Exception:  # pragma: no cover - map background is optional
     _HAS_MAP_DEPS = False
 
+from fschool_posture import (
+    decimate_polygon,
+    find_fschool_posture_files,
+    iter_frame_shapes,
+    track_id_from_path,
+)
+
 
 # ============================================================
 # UNDISTORTION (raw video pixels -> undistorted frame pixels)
@@ -612,6 +619,64 @@ def load_drone_positions(poses_path: str, dem_json_path: str
     return frame_drone, (min_x, max_x, min_y, max_y)
 
 
+def load_fschool_pixel(fschool_dir: str, video_stem: str, max_points: int
+                       ) -> Tuple[Dict[int, List[dict]], int]:
+    """Load raw pixel-space fish-school outline/hole polygons for every
+    ``<video_stem>_fschool_posture_id<N>.npz`` in ``fschool_dir``, decimated
+    to at most ``max_points`` per polygon (raw contours run into the
+    thousands of points/frame - see fschool_posture.decimate_polygon).
+    Points are absolute raw-video pixel coordinates (the per-frame ``offset``
+    stored in the npz is already applied by iter_frame_shapes).
+
+    :return: (frame_fschool, n_tracks) where frame_fschool maps a frame index
+             to a list of ``{"tid", "outline", "holes"}`` dicts.
+    """
+    files = find_fschool_posture_files(fschool_dir, video_stem)
+    frame_fschool: Dict[int, List[dict]] = defaultdict(list)
+    for fp in files:
+        tid = track_id_from_path(fp)
+        data = np.load(fp, allow_pickle=True)
+        for frame_idx, outline, holes in iter_frame_shapes(data):
+            frame_fschool[frame_idx].append({
+                "tid": tid,
+                "outline": decimate_polygon(outline, max_points),
+                "holes": [decimate_polygon(h, max_points) for h in holes],
+            })
+    return frame_fschool, len(files)
+
+
+def undistort_fschool_dets(frame_fschool: Dict[int, List[dict]], undistorter: Undistorter) -> None:
+    """Undistort all fish-school outline/hole polygons in-place (mirrors
+    undistort_frame_dets() for the shark boxes/key-points)."""
+    for dets in frame_fschool.values():
+        for det in dets:
+            if len(det["outline"]):
+                det["outline"] = undistorter.points(det["outline"].astype(np.float32))
+            det["holes"] = [
+                undistorter.points(h.astype(np.float32)) if len(h) else h for h in det["holes"]
+            ]
+
+
+def load_fschool_geo(geor_dir: str, video_stem: str) -> Dict[int, List[dict]]:
+    """Load already geo-referenced (world x/y) fish-school outline/hole
+    polygons written by export_georeferenced_fschool.py - same ragged-array
+    convention as the raw npz, just different field names and no offset to
+    add (the "_geor" points are already in world coordinates)."""
+    files = find_fschool_posture_files(geor_dir, video_stem)
+    frame_fschool: Dict[int, List[dict]] = defaultdict(list)
+    for fp in files:
+        tid = track_id_from_path(fp)
+        data = np.load(fp, allow_pickle=True)
+        for frame_idx, outline, holes in iter_frame_shapes(
+            data,
+            outline_points_key="outline_points_geor", outline_lengths_key="outline_lengths_geor",
+            hole_points_key="hole_points_geor", hole_counts_key="hole_counts_geor",
+            offset_key=None,
+        ):
+            frame_fschool[frame_idx].append({"tid": tid, "outline": outline, "holes": holes})
+    return frame_fschool
+
+
 # ============================================================
 # 4. PANEL RENDERING
 # ============================================================
@@ -699,6 +764,77 @@ def draw_drone_on_map(map_img, drone_pos, canvas_cfg, drone_history):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, DRONE_COLOR, 1, cv2.LINE_AA)
 
 
+def _fschool_color(tid):
+    """Fish-school track colour, in a distinct hue namespace from
+    id_to_color(tid) so a fschool track never looks identical to a shark
+    track that happens to share the same numeric id."""
+    return id_to_color(f"fschool{tid}")
+
+
+def _polygon_to_int_pts(points: np.ndarray, scale: float = 1.0) -> Optional[np.ndarray]:
+    """Convert a (possibly NaN-containing, e.g. failed ray-cast) polygon to
+    an int32 point array cv2.polylines can draw, dropping non-finite points
+    (a dropped point just chords across the gap rather than leaving a hole
+    in the outline - an acceptable simplification for this debug overlay)."""
+    if points is None or len(points) < 3:
+        return None
+    finite = points[np.isfinite(points).all(axis=1)]
+    if len(finite) < 3:
+        return None
+    return (finite * scale).astype(np.int32)
+
+
+def draw_fschool_pixel_panel(frame, fschool_dets, draw_scale, track_ids=None):
+    """Draws fish-school outline/hole polygons onto a (resized) video frame,
+    in pixel space - alongside draw_video_panel()'s shark boxes/key-points."""
+    for det in fschool_dets:
+        tid = det["tid"]
+        if track_ids is not None and tid not in track_ids:
+            continue
+        color = _fschool_color(tid)
+
+        outline = _polygon_to_int_pts(det["outline"], draw_scale)
+        if outline is not None:
+            cv2.polylines(frame, [outline], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+            cv2.putText(frame, f"FS {tid}", tuple(outline[0]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+        for hole in det["holes"]:
+            hole_pts = _polygon_to_int_pts(hole, draw_scale)
+            if hole_pts is not None:
+                cv2.polylines(frame, [hole_pts], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_AA)
+
+
+def draw_fschool_map_panel(map_img, fschool_geo_dets, canvas_cfg, track_ids=None):
+    """Draws geo-referenced fish-school outline/hole polygons onto the map
+    canvas - alongside draw_map_panel()'s shark boxes/trails."""
+    for det in fschool_geo_dets:
+        tid = det["tid"]
+        if track_ids is not None and tid not in track_ids:
+            continue
+        color = _fschool_color(tid)
+
+        outline_world = det["outline"]
+        outline_px = None
+        if outline_world is not None and len(outline_world):
+            finite = outline_world[np.isfinite(outline_world).all(axis=1)]
+            if len(finite) >= 3:
+                outline_px = np.array(
+                    [world_to_canvas(x, y, canvas_cfg) for x, y in finite], dtype=np.int32)
+        if outline_px is not None:
+            cv2.polylines(map_img, [outline_px], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+            cv2.putText(map_img, f"FS {tid}", tuple(outline_px[0]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+        for hole_world in det["holes"]:
+            if hole_world is None or not len(hole_world):
+                continue
+            finite = hole_world[np.isfinite(hole_world).all(axis=1)]
+            if len(finite) < 3:
+                continue
+            hole_px = np.array([world_to_canvas(x, y, canvas_cfg) for x, y in finite], dtype=np.int32)
+            cv2.polylines(map_img, [hole_px], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_AA)
+
+
 # ============================================================
 # 5. MAIN
 # ============================================================
@@ -739,7 +875,13 @@ def parse_args():
     p.add_argument("--no-video", action="store_true", help="Do not write an output video.")
     p.add_argument("--track-ids", type=int, nargs="*", default=None,
                    help="Optional subset of track ids to display.")
-    p.add_argument("--max-frames", type=int, default=None, help="Stop after N frames (debugging).")
+    p.add_argument("--start-frame", type=int, default=0,
+                   help="First source-video frame index to render (seeks the video first).")
+    p.add_argument("--end-frame", type=int, default=None,
+                   help="Stop once this source-video frame index is reached (exclusive). "
+                        "Takes precedence over --max-frames if both are given.")
+    p.add_argument("--max-frames", type=int, default=None,
+                   help="Stop after N frames counted from --start-frame (debugging).")
     p.add_argument("--map-cache", default=None, help="Directory to cache downloaded map tiles.")
     p.add_argument("--calib", default=None,
                    help="Camera calibration JSON (mtx/dist). When provided, pixel-space bounding "
@@ -749,7 +891,68 @@ def parse_args():
                    help="Raw video dimensions in pixels (e.g. 5120 2700). Required with --calib "
                         "when using --pixel-tracks-csv; inferred from the NPZ files when using "
                         "--tracking-dir.")
+    p.add_argument("--fschool-dir", default=None,
+                   help="Directory holding the raw *_fschool_posture_id<N>.npz tracklets "
+                        "(outline/hole polygons, pixel space). Defaults to --tracking-dir if "
+                        "that's given. Drawn alongside the shark boxes/key-points.")
+    p.add_argument("--fschool-geor-dir", default=None,
+                   help="Directory holding the geo-referenced *_fschool_posture_id<N>.npz "
+                        "tracklets from export_georeferenced_fschool.py (world x/y). When given, "
+                        "the fish-school outline/holes are also drawn on the map panel.")
+    p.add_argument("--fschool-max-points", type=int, default=150,
+                   help="Decimate every drawn outline/hole polygon to at most this many points "
+                        "(raw contours run into the thousands of points/frame). Default 150.")
+    p.add_argument("--no-fschool", action="store_true", help="Do not draw fish-school outlines/holes.")
     return p.parse_args()
+
+
+def _extent_from_geo_dets(frame_geo: Dict[int, list], frame_range: range
+                          ) -> Optional[Tuple[float, float, float, float]]:
+    """Bounding box of only the geo-tracks whose frame falls in frame_range.
+
+    load_geo_tracks() returns the extent over the *whole* tracks.csv - for a
+    short --start-frame/--end-frame window that pads the map canvas out to
+    the entire flight's bounding box while only a slice of it is actually
+    rendered, so the tracked animals end up a speck in a mostly-empty map.
+    """
+    xs: List[float] = []
+    ys: List[float] = []
+    for f in frame_range:
+        for det in frame_geo.get(f, []):
+            xs.extend([det["gx1"], det["gx2"]])
+            ys.extend([det["gy1"], det["gy2"]])
+    if not xs:
+        return None
+    return (min(xs), max(xs), min(ys), max(ys))
+
+
+def _extent_from_drone(frame_drone: Dict[int, Tuple[float, float]], frame_range: range
+                       ) -> Optional[Tuple[float, float, float, float]]:
+    """Same idea as _extent_from_geo_dets() but for the drone trajectory."""
+    pts = [frame_drone[f] for f in frame_range if f in frame_drone]
+    if not pts:
+        return None
+    xs, ys = zip(*pts)
+    return (min(xs), max(xs), min(ys), max(ys))
+
+
+def _extent_from_fschool_geo(frame_fschool_geo: Dict[int, List[dict]], frame_range: range
+                             ) -> Optional[Tuple[float, float, float, float]]:
+    """Same idea again, for the geo-referenced fish-school outline/hole points."""
+    xs: List[float] = []
+    ys: List[float] = []
+    for f in frame_range:
+        for det in frame_fschool_geo.get(f, []):
+            for arr in [det["outline"]] + det["holes"]:
+                if arr is None or not len(arr):
+                    continue
+                finite = arr[np.isfinite(arr).all(axis=1)]
+                if len(finite):
+                    xs.extend(finite[:, 0].tolist())
+                    ys.extend(finite[:, 1].tolist())
+    if not xs:
+        return None
+    return (min(xs), max(xs), min(ys), max(ys))
 
 
 def main():
@@ -771,6 +974,21 @@ def main():
     out_fps = args.fps or src_fps
 
     print(f"Video      : {video_path}  ({video_w}x{video_h} @ {src_fps:.1f} fps)")
+    if args.start_frame or args.end_frame is not None:
+        end_str = args.end_frame if args.end_frame is not None else "end"
+        print(f"Frame range: {args.start_frame} -> {end_str}")
+
+    # Effective rendered frame range, used to scope the map extent below (see
+    # _extent_from_geo_dets) rather than to drive frame_generator() itself, which
+    # still just reads until end-of-video/--end-frame/--max-frames on its own.
+    n_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 10 ** 9
+    if args.end_frame is not None:
+        _render_end = args.end_frame
+    elif args.max_frames is not None:
+        _render_end = args.start_frame + args.max_frames
+    else:
+        _render_end = n_video_frames
+    render_frame_range = range(args.start_frame, min(_render_end, n_video_frames))
 
     # --- Load tracking data (TRex tracklets or pixel-space MOT CSV) ---
     npz_raw_size: Optional[Tuple[int, int]] = None
@@ -796,15 +1014,51 @@ def main():
               f"{undistorter.new_size[0]}x{undistorter.new_size[1]} "
               f"using {os.path.basename(args.calib)}")
         undistort_frame_dets(frame_dets, undistorter)
+    else:
+        undistorter = None
+
+    # --- Fish-school outline/hole polygons (pixel space + optional geo space) ---
+    frame_fschool: Dict[int, List[dict]] = {}
+    frame_fschool_geo: Dict[int, List[dict]] = {}
+    if not args.no_fschool:
+        fschool_dir = args.fschool_dir or args.tracking_dir
+        if fschool_dir:
+            frame_fschool, n_fschool = load_fschool_pixel(fschool_dir, video_stem, args.fschool_max_points)
+            if n_fschool:
+                print(f"Fish school: {n_fschool} track(s), outlines on {len(frame_fschool)} frames")
+                if undistorter is not None:
+                    undistort_fschool_dets(frame_fschool, undistorter)
+        if args.fschool_geor_dir:
+            frame_fschool_geo = load_fschool_geo(args.fschool_geor_dir, video_stem)
+            if frame_fschool_geo:
+                print(f"Fish school: geo-referenced outlines on {len(frame_fschool_geo)} frames "
+                      f"({os.path.basename(args.fschool_geor_dir)})")
 
     frame_geo: Dict[int, list] = {}
     extent = None
     if args.tracks_csv:
-        frame_geo, extent = load_geo_tracks(args.tracks_csv)
+        frame_geo, _full_extent = load_geo_tracks(args.tracks_csv)
+        if _full_extent is None:
+            raise RuntimeError(
+                f"No geo-referenced tracks found in {args.tracks_csv} (the file has zero rows). "
+                f"This usually means the upstream geo-referencing step ran against a "
+                f"frame-limited extraction (e.g. a notebook debug run with a small "
+                f"--limit/DEBUG_FRAME_LIMIT) whose frames never actually contain a tracked "
+                f"animal - check that the frames that were extracted/geo-referenced overlap "
+                f"with where the animal is actually visible in the video."
+            )
+        extent = _extent_from_geo_dets(frame_geo, render_frame_range)
         if extent is None:
-            raise RuntimeError(f"No geo-referenced tracks found in {args.tracks_csv}")
-        print(f"Geo tracks : {len(frame_geo)} frames, extent E[{extent[0]:.1f},{extent[1]:.1f}] "
-              f"N[{extent[2]:.1f},{extent[3]:.1f}]")
+            raise RuntimeError(
+                f"No geo-referenced tracks fall within the rendered frame range "
+                f"[{render_frame_range.start}, {render_frame_range.stop}) in {args.tracks_csv}, "
+                f"even though the file has data for other frames. Check --start-frame/--end-frame "
+                f"(or RENDER_START_FRAME/RENDER_END_FRAME in the notebook) against the frame range "
+                f"that was actually extracted/geo-referenced (e.g. DEBUG_FRAME_LIMIT only covers "
+                f"frames 0..N-1)."
+            )
+        print(f"Geo tracks : {len(frame_geo)} frames total, extent (this range) "
+              f"E[{extent[0]:.1f},{extent[1]:.1f}] N[{extent[2]:.1f},{extent[3]:.1f}]")
     else:
         print("Geo tracks : none (--tracks-csv not given) - map panel disabled, "
               "writing pixel-space video only.")
@@ -815,10 +1069,13 @@ def main():
         if not args.dem_json:
             raise ValueError("--poses requires --dem-json (for the origin offset).")
         print("Drone      : loading poses ...")
-        frame_drone, drone_extent = load_drone_positions(args.poses, args.dem_json)
+        frame_drone, _full_drone_extent = load_drone_positions(args.poses, args.dem_json)
         print(f"Drone      : {len(frame_drone)} positions")
+        drone_extent = _extent_from_drone(frame_drone, render_frame_range)
         if drone_extent is not None:
-            # Grow the map extent so the whole drone trajectory stays visible.
+            # Grow the map extent (restricted to the same rendered frame range) so the
+            # drone position stays visible without re-inflating it back out to the
+            # whole flight's bounding box.
             extent = (
                 min(extent[0], drone_extent[0]), max(extent[1], drone_extent[1]),
                 min(extent[2], drone_extent[2]), max(extent[3], drone_extent[3]),
@@ -826,6 +1083,15 @@ def main():
     elif args.poses:
         print("Drone      : --poses given but no --tracks-csv - skipping drone overlay "
               "(there is no map panel to draw it on).")
+
+    # --- Grow the extent for the geo-referenced fish-school outlines too, same scoping ---
+    if extent is not None and frame_fschool_geo:
+        fschool_extent = _extent_from_fschool_geo(frame_fschool_geo, render_frame_range)
+        if fschool_extent is not None:
+            extent = (
+                min(extent[0], fschool_extent[0]), max(extent[1], fschool_extent[1]),
+                min(extent[2], fschool_extent[2]), max(extent[3], fschool_extent[3]),
+            )
 
     # --- Map canvas setup ---
     draw_scale = args.display_width / video_w
@@ -864,19 +1130,26 @@ def main():
     track_history: Dict[int, list] = defaultdict(list)
     drone_history: list = []
 
+    if args.start_frame:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
+
     def frame_generator():
-        frame_idx = 0
+        frame_idx = args.start_frame
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
-            if args.max_frames is not None and frame_idx >= args.max_frames:
+            if args.end_frame is not None and frame_idx >= args.end_frame:
+                break
+            if args.max_frames is not None and frame_idx >= args.start_frame + args.max_frames:
                 break
 
             # --- Video panel (pixel space) ---
             vid_panel = cv2.resize(frame, (args.display_width, disp_h), interpolation=cv2.INTER_AREA)
             draw_video_panel(vid_panel, frame_dets.get(frame_idx, []), draw_scale,
                              draw_keypoints=not args.no_keypoints, track_ids=track_ids)
+            draw_fschool_pixel_panel(vid_panel, frame_fschool.get(frame_idx, []), draw_scale,
+                                     track_ids=track_ids)
             cv2.putText(vid_panel, "Video (pixel space)", (10, disp_h - 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
@@ -887,6 +1160,8 @@ def main():
                 visible_tids: set = set()
                 draw_map_panel(map_img, frame_geo.get(frame_idx, []), canvas_cfg,
                                track_history, visible_tids, track_ids=track_ids)
+                draw_fschool_map_panel(map_img, frame_fschool_geo.get(frame_idx, []), canvas_cfg,
+                                       track_ids=track_ids)
                 if frame_drone:
                     draw_drone_on_map(map_img, frame_drone.get(frame_idx), canvas_cfg, drone_history)
                 draw_axes_on_canvas(map_img, canvas_cfg)
