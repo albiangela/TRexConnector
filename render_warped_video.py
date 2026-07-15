@@ -12,14 +12,30 @@ the same ray-cast pixel_to_world_coord() used elsewhere in this pipeline
 plain cv2.warpPerspective - no GPU/EGL context required, consistent with the
 rest of TRexConnector's "no QGIS/GPU needed" approach.
 
-Two passes:
+Passes:
   1. Corner pass (cheap, no video decode): for every frame in range, project
      the 4 corners of the undistorted frame onto the ground plane, to size a
      canvas that covers the whole requested range without clipping.
-  2. Render pass: decode+undistort each frame, warp it into the canvas via
-     the per-frame homography, and (optionally) overlay the geo-referenced
-     TRex tracks (tracks.csv) and the drone's own trajectory - both already
-     in the same world CRS, so no further projection is needed for them.
+  2. Marker pass (optional, needs --aruco-dict markers in view): decodes the
+     video once to detect ArUco markers and project their centers through
+     each frame's (uncorrected) homography, in order to measure how much a
+     supposedly-fixed physical marker still drifts on the canvas - telemetry
+     alone (even smoothed) has residual pose error, and anything not exactly
+     on the flat projection plane (a marker on land, unlike the sea-level
+     plane) shows parallax as the camera moves, so the raw telemetry-only
+     warp is never perfectly stable. Each marker's median canvas position
+     across the frames it's detected in is taken as its reference ("this is
+     where it should stay"), and every frame gets a corrective similarity
+     transform (or pure translation with only one marker visible) nudging
+     its detected marker(s) back onto that reference - interpolated across
+     frames with no detection so there's no visible pop when detection
+     flickers. Since the shark/fish-school positions are geo-referenced from
+     the exact same camera pose, this correction is composed into the warp
+     homography itself (not just a cosmetic overlay tweak), correcting the
+     same underlying pose error for both.
+  3. Render pass: decode+undistort each frame, warp it into the canvas via
+     the per-frame (corrected) homography, and (optionally) overlay the
+     geo-referenced TRex tracks (tracks.csv) and the drone's own trajectory.
 
 Example
 -------
@@ -56,6 +72,7 @@ from trex_to_bambi import (
     load_correction,
     load_projection_mesh,
 )
+import visualize_trex_video_and_map as vis_mod
 from visualize_trex_video_and_map import (
     MapTileProvider,
     draw_axes_on_canvas,
@@ -155,15 +172,140 @@ def compute_corner_world_positions(poses: dict, frame_range: range, tri_mesh, of
 
 
 # --------------------------------------------------------------------------- #
-# Pass 2: warp each frame into the shared canvas
+# Pass 2: ArUco marker detection -> per-frame corrective transform
+# --------------------------------------------------------------------------- #
+def build_aruco_detector(dict_name: str) -> "cv2.aruco.ArucoDetector":
+    aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dict_name))
+    return cv2.aruco.ArucoDetector(aruco_dict, cv2.aruco.DetectorParameters())
+
+
+def detect_marker_centers(detector, gray_frame: np.ndarray) -> Dict[int, np.ndarray]:
+    """{marker_id: (x, y) pixel center} for every marker found in one frame."""
+    corners, ids, _rejected = detector.detectMarkers(gray_frame)
+    if ids is None:
+        return {}
+    return {int(i): c.reshape(-1, 2).mean(axis=0) for c, i in zip(corners, ids.ravel())}
+
+
+def detect_marker_canvas_positions(
+    video_path: str, frame_range: range, undistorter: Undistorter,
+    corners_by_frame: Dict[int, Optional[np.ndarray]], canvas_cfg: dict, aruco_dict_name: str,
+) -> Dict[int, Dict[int, np.ndarray]]:
+    """Decode the video once, undistort + detect ArUco markers per frame, and
+    project each detected marker's center through *that frame's own*
+    (uncorrected) corner-homography onto the canvas.
+
+    Returns {frame_idx: {marker_id: (canvas_x, canvas_y)}} for frames where at
+    least one marker was found (frames with no ground-plane projection or no
+    detection are simply absent).
+    """
+    detector = build_aruco_detector(aruco_dict_name)
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_range.start)
+
+    detections: Dict[int, Dict[int, np.ndarray]] = {}
+    n_frames_with_marker = 0
+    for frame_idx in frame_range:
+        ok, raw_frame = cap.read()
+        if not ok:
+            break
+        world_corners = corners_by_frame.get(frame_idx)
+        if world_corners is None:
+            continue
+        undist_frame = undistorter.image(raw_frame)
+        gray = cv2.cvtColor(undist_frame, cv2.COLOR_BGR2GRAY)
+        centers = detect_marker_centers(detector, gray)
+        if not centers:
+            continue
+
+        h, w = undist_frame.shape[:2]
+        src = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
+        dst = np.array([world_to_canvas(x, y, canvas_cfg) for x, y in world_corners], dtype=np.float32)
+        homography = cv2.getPerspectiveTransform(src, dst)
+
+        pts = np.array([[c] for c in centers.values()], dtype=np.float32)
+        canvas_pts = cv2.perspectiveTransform(pts, homography).reshape(-1, 2)
+        detections[frame_idx] = dict(zip(centers.keys(), canvas_pts))
+        n_frames_with_marker += 1
+    cap.release()
+
+    print(f"   ArUco: detected in {n_frames_with_marker}/{len(frame_range)} frames "
+          f"(ids seen: {sorted({mid for d in detections.values() for mid in d})})")
+    return detections
+
+
+def compute_marker_references(detections: Dict[int, Dict[int, np.ndarray]]) -> Dict[int, np.ndarray]:
+    """Per marker id, the median canvas position across every frame it was
+    detected in - i.e. "this is where a truly static marker should sit",
+    robust to occasional bad detections (median, not mean)."""
+    per_marker: Dict[int, list] = defaultdict(list)
+    for frame_dets in detections.values():
+        for mid, pos in frame_dets.items():
+            per_marker[mid].append(pos)
+    return {mid: np.median(np.array(pts), axis=0) for mid, pts in per_marker.items()}
+
+
+def compute_frame_corrections(
+    detections: Dict[int, Dict[int, np.ndarray]], references: Dict[int, np.ndarray], frame_range: range,
+) -> Dict[int, np.ndarray]:
+    """Per-frame 3x3 canvas->canvas corrective transform nudging this frame's
+    detected marker(s) onto their reference position: a pure translation with
+    one marker matched, a similarity fit (rotation+scale+translation) with
+    two or more. Frames with no matched marker interpolate between the
+    nearest frames that do (np.interp naturally holds the edge value outside
+    the known range), so detection flicker doesn't cause a visible pop.
+    """
+    # Per-frame similarity-transform parameters (a, b, tx, ty) representing
+    # [[a, -b, tx], [b, a, ty], [0, 0, 1]] - a translation-only correction is
+    # just this same form with a=1, b=0.
+    raw_params: Dict[int, np.ndarray] = {}
+    for frame_idx in frame_range:
+        matched = [(references[mid], pos) for mid, pos in detections.get(frame_idx, {}).items()
+                  if mid in references]
+        if not matched:
+            continue
+        if len(matched) == 1:
+            ref, pos = matched[0]
+            raw_params[frame_idx] = np.array([1.0, 0.0, ref[0] - pos[0], ref[1] - pos[1]])
+            continue
+        src_pts = np.array([pos for _, pos in matched], dtype=np.float32)
+        dst_pts = np.array([ref for ref, _ in matched], dtype=np.float32)
+        M, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts)
+        if M is None:
+            ref, pos = matched[0]
+            raw_params[frame_idx] = np.array([1.0, 0.0, ref[0] - pos[0], ref[1] - pos[1]])
+        else:
+            raw_params[frame_idx] = np.array([M[0, 0], M[1, 0], M[0, 2], M[1, 2]])
+
+    if not raw_params:
+        return {frame_idx: np.eye(3) for frame_idx in frame_range}
+
+    known_frames = np.array(sorted(raw_params.keys()))
+    known_params = np.array([raw_params[f] for f in known_frames])
+    query_frames = np.array(list(frame_range))
+    interp_params = np.stack(
+        [np.interp(query_frames, known_frames, known_params[:, k]) for k in range(4)], axis=1,
+    )
+
+    corrections: Dict[int, np.ndarray] = {}
+    for frame_idx, (a, b, tx, ty) in zip(query_frames, interp_params):
+        corrections[int(frame_idx)] = np.array([[a, -b, tx], [b, a, ty], [0.0, 0.0, 1.0]])
+    return corrections
+
+
+# --------------------------------------------------------------------------- #
+# Pass 3: warp each frame into the shared canvas
 # --------------------------------------------------------------------------- #
 def warp_frame_onto_canvas(undist_frame: np.ndarray, world_corners: np.ndarray,
-                           canvas_cfg: dict, base: np.ndarray) -> np.ndarray:
+                           canvas_cfg: dict, base: np.ndarray,
+                           correction: Optional[np.ndarray] = None) -> np.ndarray:
     h, w = undist_frame.shape[:2]
     src = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
     dst = np.array([world_to_canvas(x, y, canvas_cfg) for x, y in world_corners], dtype=np.float32)
 
     homography = cv2.getPerspectiveTransform(src, dst)
+    if correction is not None:
+        homography = correction @ homography
     canvas_size = (canvas_cfg["width"], canvas_cfg["height"])
     warped = cv2.warpPerspective(undist_frame, homography, canvas_size)
     mask = cv2.warpPerspective(
@@ -173,6 +315,31 @@ def warp_frame_onto_canvas(undist_frame: np.ndarray, world_corners: np.ndarray,
     out = base.copy()
     out[mask > 0] = warped[mask > 0]
     return out
+
+
+def make_corrected_world_to_canvas(correction: Optional[np.ndarray]):
+    """A world_to_canvas() replacement that applies the same per-frame ArUco
+    correction as the warped image itself.
+
+    draw_map_panel()/draw_drone_on_map()/draw_axes_on_canvas() (imported from
+    visualize_trex_video_and_map) all resolve the name "world_to_canvas" from
+    *that module's* globals at call time, not from whatever's imported here -
+    so correcting only warp_frame_onto_canvas() and leaving those untouched
+    left the track boxes/drone marker pinned to the old, uncorrected canvas
+    position while the image content moved out from under them (visible as
+    the tracked shark drifting away from its own bounding box). Patching
+    vis_mod.world_to_canvas makes every overlay draw call go through the same
+    correction as the image, keeping them all consistent.
+    """
+    if correction is None:
+        return world_to_canvas
+
+    def _corrected(x, y, canvas_cfg):
+        px, py = world_to_canvas(x, y, canvas_cfg)
+        cx, cy, _ = correction @ np.array([px, py, 1.0])
+        return int(round(cx)), int(round(cy))
+
+    return _corrected
 
 
 # --------------------------------------------------------------------------- #
@@ -225,6 +392,15 @@ def parse_args(argv=None):
                         "ramps in the raw telemetry (e.g. coarsely-sampled altitude) that would "
                         "otherwise make the warp visibly tremble even during smooth flight. "
                         "Set to 0 or 1 to use the raw, unsmoothed poses.")
+    p.add_argument("--no-aruco-correct", action="store_true",
+                   help="Don't detect/correct against ArUco markers (see --aruco-dict) - telemetry "
+                        "(smoothed) homography only. Even smoothed telemetry has residual pose "
+                        "error, and anything off the flat projection plane (e.g. a marker on land) "
+                        "shows parallax as the camera moves, so a fixed marker still drifts a bit "
+                        "on the canvas without this correction.")
+    p.add_argument("--aruco-dict", default="DICT_4X4_50",
+                   help="cv2.aruco predefined dictionary name to detect markers with. "
+                        "Default DICT_4X4_50 (confirmed working on this survey's markers).")
     return p.parse_args(argv)
 
 
@@ -328,6 +504,21 @@ def main(argv=None) -> None:
         else:
             print("   Could not build map background (offline?) - using blank canvas.")
 
+    corrections: Dict[int, np.ndarray] = {}
+    if not args.no_aruco_correct:
+        print(f"3. Detecting ArUco markers ({args.aruco_dict}) for drift correction (pass 2)")
+        marker_detections = detect_marker_canvas_positions(
+            args.video, frame_range, undistorter, corners_by_frame, canvas_cfg, args.aruco_dict,
+        )
+        references = compute_marker_references(marker_detections)
+        if references:
+            for mid, ref in sorted(references.items()):
+                print(f"   marker {mid}: reference canvas position ({ref[0]:.1f}, {ref[1]:.1f}), "
+                      f"seen in {sum(mid in d for d in marker_detections.values())} frames")
+            corrections = compute_frame_corrections(marker_detections, references, frame_range)
+        else:
+            print("   No markers detected in this range - proceeding without correction.")
+
     cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
     track_history: Dict[int, list] = defaultdict(list)
     drone_history: list = []
@@ -346,7 +537,14 @@ def main(argv=None) -> None:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             else:
                 undist_frame = undistorter.image(raw_frame)
-                canvas = warp_frame_onto_canvas(undist_frame, world_corners, canvas_cfg, base)
+                canvas = warp_frame_onto_canvas(undist_frame, world_corners, canvas_cfg, base,
+                                               correction=corrections.get(frame_idx))
+
+            # Overlays (tracks/drone/axes) are geo-referenced from the exact same
+            # camera pose as the warped image, so they need the exact same per-frame
+            # ArUco correction applied - otherwise the image content shifts under
+            # them and a tracked animal visibly drifts away from its own box.
+            vis_mod.world_to_canvas = make_corrected_world_to_canvas(corrections.get(frame_idx))
 
             visible_tids: set = set()
             draw_map_panel(canvas, frame_geo.get(frame_idx, []), canvas_cfg,
@@ -359,7 +557,7 @@ def main(argv=None) -> None:
 
             yield frame_idx, canvas
 
-    print("3. Warping + writing video (pass 2)")
+    print("4. Warping + writing video (pass 3)")
     writer = make_ffmpeg_writer()
     if writer is not None:
         writer.write(args.output, frame_generator(), target_fps=out_fps)
